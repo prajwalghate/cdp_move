@@ -1,0 +1,18 @@
+[package]
+name = "cdpContract"
+version = "1.0.0"
+authors = []
+
+[addresses]
+cdp="0x1e54313f47251c2ef107578da12935f8abe6bee77410e06c804e28d23c156f44"
+
+
+[dev-addresses]
+
+[dependencies.SupraFramework]
+git = "https://github.com/Entropy-Foundation/aptos-core.git"
+rev = "dev"
+subdir = "aptos-move/framework/supra-framework"
+
+
+[dev-dependencies]
