@@ -43,14 +43,14 @@ module cdp::cdpContract {
             8, // decimals
             true // monitor_supply
         );
-        // coin::register<SupraCoin>(admin);
+        coin::register<SupraCoin>(admin);
 
         coin::register<ORECoin>(admin);
         // coin::register<SupraCoin>(admin);
 
         // Set default parameters
         move_to(admin, ConfigParams {
-            minimum_debt: 2 * 100000000, // 2000 USD in base units
+            minimum_debt: 2 * 10000000, // 0.2  in base units
             mcr: 11000, // 110%
             borrow_rate: 500, // 5% annual rate
             liquidation_reserve: 200 * 100000000, // 200 USD in base units
@@ -122,6 +122,12 @@ module cdp::cdpContract {
         vault_manager.total_debt = vault_manager.total_debt + total_debt;
     }
 
+    // public entry fun initialize_coin_store(account: &signer) {
+    //     if (!coin::is_account_registered<SupraCoin>(signer::address_of(account))) {
+    //         coin::register<SupraCoin>(account);
+    //     }
+    // }
+
 
     #[view]
     public fun get_config(): (u64, u64, u64, u64, u64) acquires ConfigParams {
@@ -159,7 +165,8 @@ module cdp::cdpContract_tests {
      fun test_successful_initialization() {
          let admin = get_admin_account();
          let admin_addr = signer::address_of(&admin);
-         
+        //  let framework = account::create_account_for_test(@0x1);
+        //  supra_framework::supra_coin::initialize_for_test(&admin);
          // Initialize the contract 
          cdpContract::initialize(&admin);
 
@@ -262,6 +269,22 @@ module cdp::cdpContract_tests {
         coin::destroy_mint_cap(mint_cap);
         coin::destroy_burn_cap(burn_cap);
     }
+
+
+    // #[test]
+    // fun test_initialize_coin_store() {
+    //     let admin = get_admin_account();
+    //     let user = account::create_account_for_test(@0x456);
+        
+    //     // Ensure the user account is not registered for SupraCoin initially
+    //     assert!(!coin::is_account_registered<SupraCoin>(signer::address_of(&user)), 0);
+        
+    //     // Initialize the coin store for the user
+    //     cdpContract::initialize_coin_store(&admin);
+        
+    //     // Verify that the user account is now registered for SupraCoin
+    //     assert!(coin::is_account_registered<SupraCoin>(signer::address_of(&admin)), 1);
+    // }
 
     // #[test]
     // fun test_mint_ore() {
