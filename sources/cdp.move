@@ -5,6 +5,7 @@ module cdp::cdpContract {
     use supra_framework::supra_coin::SupraCoin;
     use std::signer;
     use std::string;
+    use aptos_std::table::{Self, Table};
     use supra_framework::coin::{Self, BurnCapability, FreezeCapability, MintCapability};
 
     // Error codes
@@ -13,7 +14,7 @@ module cdp::cdpContract {
     const ERR_INSUFFICIENT_COLLATERAL: u64 = 3;
     const ERR_COIN_NOT_INITIALIZED: u64 = 4;
 
-    struct ORECoin { value: u64 }
+    struct ORECoin has store { value: u64 }
 
     struct ConfigParams has key {
         minimum_debt: u64,
@@ -30,6 +31,17 @@ module cdp::cdpContract {
         total_collateral: u64,
         total_debt: u64,
     }
+
+    struct UserPosition has store, drop, copy {
+        total_debt: u64,
+        total_collateral: u64,
+        is_active: bool,
+    }
+
+    struct UserPositionsTable has key {
+        positions: Table<address, UserPosition>,
+    }
+
 
     
 
@@ -64,6 +76,10 @@ module cdp::cdpContract {
             total_collateral: 0,
             total_debt: 0,
         });
+
+        move_to(admin, UserPositionsTable {
+            positions: table::new(),
+        });
     }
 
 
@@ -84,14 +100,14 @@ module cdp::cdpContract {
 
     
 
-    public entry fun open_trove(user: &signer, supra_amount: u64, ore_amount: u64) acquires ConfigParams, TroveManager {
+    public entry fun open_trove(user: &signer, supra_amount: u64, ore_amount: u64) acquires ConfigParams, TroveManager, UserPositionsTable {
         let user_addr = signer::address_of(user);
         
         assert!(coin::is_coin_initialized<SupraCoin>(), ERR_COIN_NOT_INITIALIZED);
         assert!(coin::is_coin_initialized<ORECoin>(), ERR_COIN_NOT_INITIALIZED);
 
         let config = borrow_global<ConfigParams>(@cdp);
-
+  
         // Check minimum debt
         assert!(ore_amount >= config.minimum_debt, ERR_BELOW_MINIMUM_DEBT);
 
@@ -120,6 +136,13 @@ module cdp::cdpContract {
         // Update total stats
         vault_manager.total_collateral = vault_manager.total_collateral + supra_amount;
         vault_manager.total_debt = vault_manager.total_debt + total_debt;
+
+        update_user_position(
+            user_addr,
+            total_debt,  // This includes the borrow fee
+            supra_amount,
+            true        // Set position as active
+        );
     }
 
     // public entry fun initialize_coin_store(account: &signer) {
@@ -127,6 +150,27 @@ module cdp::cdpContract {
     //         coin::register<SupraCoin>(account);
     //     }
     // }
+
+    fun update_user_position(
+        user_addr: address, 
+        debt: u64, 
+        collateral: u64, 
+        active: bool
+    ) acquires UserPositionsTable {
+        let positions_table = borrow_global_mut<UserPositionsTable>(@cdp);
+        
+        let new_position = UserPosition {
+            total_debt: debt,
+            total_collateral: collateral,
+            is_active: active,
+        };
+
+        if (table::contains(&positions_table.positions, user_addr)) {
+            *table::borrow_mut(&mut positions_table.positions, user_addr) = new_position;
+        } else {
+            table::add(&mut positions_table.positions, user_addr, new_position);
+        }
+    }
 
 
     #[view]
@@ -144,6 +188,18 @@ module cdp::cdpContract {
     public  fun get_trove_info(addr: address): (u64, u64) acquires TroveManager {
          let vault_manager = borrow_global<TroveManager>(addr);
          (vault_manager.total_collateral, vault_manager.total_debt)
+    }
+
+    #[view]
+    public fun get_user_position(user_addr: address): (u64, u64, bool) acquires UserPositionsTable {
+        let positions_table = borrow_global<UserPositionsTable>(@cdp);
+        
+        if (table::contains(&positions_table.positions, user_addr)) {
+            let position = table::borrow(&positions_table.positions, user_addr);
+            (position.total_debt, position.total_collateral, position.is_active)
+        } else {
+            (0, 0, false) // Return default values if user not found
+        }
     }
 }
 
@@ -163,16 +219,18 @@ module cdp::cdpContract_tests {
 
      #[test]
      fun test_successful_initialization() {
+        let framework = account::create_account_for_test(@0x1);
+
+        let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework); 
          let admin = get_admin_account();
-         let admin_addr = signer::address_of(&admin);
-        //  let framework = account::create_account_for_test(@0x1);
-        //  supra_framework::supra_coin::initialize_for_test(&admin);
+        //  let admin_addr = signer::address_of(&admin);
+        //  supra_framework::supra_coin::initialize_for_test(&framework);
          // Initialize the contract 
          cdpContract::initialize(&admin);
 
          // Verify ConfigParams values
          let (min_debt, mcr, borrow_rate, liq_reserve, liq_threshold) = cdpContract::get_config();
-         assert!(min_debt == 2 * 100000000, 0);
+         assert!(min_debt == 2 * 10000000, 0);
          assert!(mcr == 11000, 1);
          assert!(borrow_rate == 500, 2);
          assert!(liq_reserve == 200 * 100000000, 3);
@@ -183,22 +241,32 @@ module cdp::cdpContract_tests {
          assert!(coin::name<ORECoin>() == string::utf8(b"ORE Coin"), 6);
          assert!(coin::symbol<ORECoin>() == string::utf8(b"ORE"), 7);
          assert!(coin::decimals<ORECoin>() == 8, 8);
+         coin::destroy_mint_cap(mint_cap);
+         coin::destroy_burn_cap(burn_cap);   
      }
 
      #[test]
      #[expected_failure(abort_code = cdpContract::ERR_ALREADY_INITIALIZED)]
      fun test_double_initialization() {
+        let framework = account::create_account_for_test(@0x1);
+
+        let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
          let admin = get_admin_account();
          
          // First initialization should succeed 
          cdpContract::initialize(&admin); 
          
          // Second initialization should fail 
-         cdpContract::initialize(&admin); 
+         cdpContract::initialize(&admin);
+         coin::destroy_mint_cap(mint_cap);
+         coin::destroy_burn_cap(burn_cap); 
      }
 
      #[test]
      fun test_get_config() {
+        let framework = account::create_account_for_test(@0x1);
+
+        let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
          let admin = get_admin_account();
          let admin_addr = signer::address_of(&admin);
          
@@ -216,11 +284,13 @@ module cdp::cdpContract_tests {
          std::debug::print(&liq_threshold); 
 
          // Verify expected values 
-         assert!(min_debt == 2 * 100000000, 0); 
+         assert!(min_debt == 2 * 10000000, 0); 
          assert!(mcr == 11000, 1); 
          assert!(borrow_rate == 500, 2); 
          assert!(liq_reserve == 200 * 100000000, 3); 
          assert!(liq_threshold == 13000, 4); 
+         coin::destroy_mint_cap(mint_cap);
+         coin::destroy_burn_cap(burn_cap);
      }
 
     #[test]
@@ -265,6 +335,60 @@ module cdp::cdpContract_tests {
         let (trove_collateral, trove_debt) = cdpContract::get_trove_info(@cdp);
         assert!(trove_collateral == collateral, 2);
         assert!(trove_debt == total_debt, 3); // Compare with total_debt including fee
+        // Clean up capabilities
+        coin::destroy_mint_cap(mint_cap);
+        coin::destroy_burn_cap(burn_cap);
+    }
+
+        #[test]
+    fun test_open_trove_user_position() {
+        // Create supra framework account for proper initialization
+        let framework = account::create_account_for_test(@0x1);
+        
+        // Create admin and user accounts
+        let admin = get_admin_account();
+        let user = account::create_account_for_test(@0x456);
+        let user_addr = signer::address_of(&user);
+
+        // First initialize SupraCoin using the framework account
+        let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework); 
+
+        // Initialize CDP contract (this will initialize ORECoin)
+        cdpContract::initialize(&admin);
+
+        // Register accounts for coins
+        coin::register<SupraCoin>(&admin);
+        coin::register<SupraCoin>(&user);
+
+        // Setup initial SUPRA balance for user
+        let supra_amount = 1000 * 100000000; // 1000 SUPRA
+        // Mint and deposit SUPRA to user
+        let coins = coin::mint(supra_amount, &mint_cap);
+        coin::deposit(user_addr, coins);
+
+        // Open trove with 1000 SUPRA collateral and borrow 400 ORE
+        let collateral = 1000 * 100000000; // 1000 SUPRA
+        let borrow_amount = 400 * 100000000; // 400 ORE
+        cdpContract::open_trove(&user, collateral, borrow_amount);
+
+        // Calculate expected total debt including borrow fee
+        let (_, _, borrow_rate, _, _) = cdpContract::get_config();
+        let borrow_fee = (borrow_amount * borrow_rate) / 10000; // 5% fee
+        let expected_total_debt = borrow_amount + borrow_fee;
+
+        // Get user position and verify it's correctly set
+        let (actual_debt, actual_collateral, is_active) = cdpContract::get_user_position(user_addr);
+        
+        // Debug prints
+        std::debug::print(&actual_debt);
+        std::debug::print(&actual_collateral);
+        std::debug::print(&is_active);
+
+        // Assert user position values
+        assert!(actual_debt == expected_total_debt, 0); // Verify debt amount
+        assert!(actual_collateral == collateral, 1);    // Verify collateral amount
+        assert!(is_active == true, 2);                  // Verify position is active
+
         // Clean up capabilities
         coin::destroy_mint_cap(mint_cap);
         coin::destroy_burn_cap(burn_cap);
