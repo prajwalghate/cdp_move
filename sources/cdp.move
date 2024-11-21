@@ -5,6 +5,8 @@ module cdp::cdpContract {
     use supra_framework::supra_coin::SupraCoin;
     use std::signer;
     use std::string;
+    // use std::event;
+    use std::fixed_point32::{Self, FixedPoint32};
     use aptos_std::table::{Self, Table};
     use supra_framework::coin::{Self, BurnCapability, FreezeCapability, MintCapability};
     use supra_framework::account;
@@ -99,23 +101,6 @@ module cdp::cdpContract {
     }
 
 
-    // public entry fun mint_ore(user: &signer, amount: u64) acquires TroveManager {
-        
-    //     coin::register<ORECoin>(user);
-        
-    //     let user_addr = signer::address_of(user);
-    //     // Mint ORE tokens to user
-    //     let vault_manager = borrow_global_mut<TroveManager>(@cdp);
-        
-    //     let ore_coins = coin::mint(amount, &vault_manager.ore_mint_cap);
-    //     coin::deposit(user_addr, ore_coins);
-
-    //     coin::transfer<SupraCoin>(user, @cdp, 100000000);
-        
-    // }
-
-    
-
    public entry fun open_trove(
         user: &signer,
         supra_deposit: u64,
@@ -132,9 +117,7 @@ module cdp::cdpContract {
         let total_debt = ore_mint + borrow_fee;
         
         // Verify MCR condition
-        let total_collateral_value = supra_deposit * get_supra_price() / 100000000;
-        let collateral_ratio = (total_collateral_value * 10000) / total_debt;
-        assert!(collateral_ratio >= config.mcr, ERR_INSUFFICIENT_COLLATERAL);
+        verify_collateral_ratio(supra_deposit, total_debt);
         
         let signer_cap = &borrow_global<SignerCapability>(@cdp).cap;
         let resource_signer = account::create_signer_with_capability(signer_cap);
@@ -176,10 +159,8 @@ module cdp::cdpContract {
         let borrow_fee = (ore_mint * borrow_global<ConfigParams>(@cdp).borrow_rate) / 10000;
         let new_debt = position.total_debt + ore_mint + borrow_fee;
         
-        // Verify MCR condition
-        let total_collateral_value = new_collateral * get_supra_price() / 100000000;
-        let collateral_ratio = (total_collateral_value * 10000) / new_debt;
-        assert!(collateral_ratio >= borrow_global<ConfigParams>(@cdp).mcr, ERR_INSUFFICIENT_COLLATERAL);
+        // Verify MCR condition using fixed point math
+        verify_collateral_ratio(new_collateral, new_debt);
         
         // Handle SUPRA deposit
         if (supra_deposit > 0) {
@@ -226,9 +207,7 @@ module cdp::cdpContract {
         
         // If there's remaining debt, verify MCR condition
         if (new_debt > 0) {
-            let total_collateral_value = new_collateral * get_supra_price() / 100000000;
-            let collateral_ratio = (total_collateral_value * 10000) / new_debt;
-            assert!(collateral_ratio >= borrow_global<ConfigParams>(@cdp).mcr, ERR_INSUFFICIENT_COLLATERAL);
+            verify_collateral_ratio(new_collateral, new_debt);
         };
         
         // Handle SUPRA withdrawal
@@ -241,7 +220,7 @@ module cdp::cdpContract {
             let resource_addr = signer::address_of(&resource_signer);
             
             // Debug print balances before transfer
-            std::debug::print(&coin::balance<SupraCoin>(resource_addr));
+            // std::debug::print(&coin::balance<SupraCoin>(resource_addr));
             
             coin::transfer<SupraCoin>(&resource_signer, user_addr, supra_withdraw);
             vault_manager.total_collateral = vault_manager.total_collateral - supra_withdraw;
@@ -259,20 +238,17 @@ module cdp::cdpContract {
         update_user_position(user_addr, new_debt, new_collateral, new_debt > 0)
     }
 
+    
 
-    public entry fun close_trove(user: &signer) acquires TroveManager, UserPositionsTable, SignerCapability 
-    {
+    public entry fun close_trove(user: &signer) acquires TroveManager, UserPositionsTable, SignerCapability {
         let user_addr = signer::address_of(user);
         
         // Get user's current position
         let positions_table = borrow_global<UserPositionsTable>(@cdp);
         assert!(table::contains(&positions_table.positions, user_addr), ERR_NO_TROVE_EXISTS);
         let position = table::borrow(&positions_table.positions, user_addr);
-        let user_balance = coin::balance<ORECoin>(user_addr);
-        std::debug::print(&b"User ORE Balance:");
-        std::debug::print(&user_balance);
-        std::debug::print(&b"Total Debt:");
-        std::debug::print(&position.total_debt);
+        // let user_balance = coin::balance<ORECoin>(user_addr);
+        
         // Ensure user has enough ORE to repay debt
         assert!(coin::balance<ORECoin>(user_addr) >= position.total_debt, ERR_INSUFFICIENT_DEBT_BALANCE);
         
@@ -285,6 +261,7 @@ module cdp::cdpContract {
         // Return collateral to user
         let signer_cap = &borrow_global<SignerCapability>(@cdp).cap;
         let resource_signer = account::create_signer_with_capability(signer_cap);
+        
         coin::transfer<SupraCoin>(&resource_signer, user_addr, position.total_collateral);
         vault_manager.total_collateral = vault_manager.total_collateral - position.total_collateral;
         
@@ -292,10 +269,7 @@ module cdp::cdpContract {
         update_user_position(user_addr, 0, 0, false)
     }
 
-
-
-
-
+    
     fun update_user_position(
         user_addr: address, 
         debt: u64, 
@@ -317,6 +291,17 @@ module cdp::cdpContract {
         }
     }
 
+    public fun verify_collateral_ratio(collateral: u64, debt: u64) acquires ConfigParams {
+        if (debt > 0) {
+            let price = get_supra_price();
+            let total_collateral_value = fixed_point32::multiply_u64(collateral, price);
+            let ratio_multiplier = fixed_point32::create_from_rational(10000, 1);
+            let mcr_check = fixed_point32::multiply_u64(total_collateral_value, ratio_multiplier) / debt;
+            
+            assert!(mcr_check >= borrow_global<ConfigParams>(@cdp).mcr, ERR_INSUFFICIENT_COLLATERAL);
+        }
+    }
+
 
     #[view]
     public fun get_config(): (u64, u64, u64, u64, u64) acquires ConfigParams {
@@ -325,8 +310,14 @@ module cdp::cdpContract {
     }
 
     #[view]
-    fun get_supra_price(): u64 {
-         100000000
+    public fun get_supra_price(): fixed_point32::FixedPoint32 {
+        fixed_point32::create_from_rational(10 * 100000000, 100000000) // 10 USD
+    }
+
+    #[view]
+    public fun get_supra_price_raw(): u64 {
+        let price = get_supra_price();
+        fixed_point32::multiply_u64(100000000, price) // Convert FixedPoint32 to u64 with 8 decimals
     }
 
     #[view]
@@ -347,6 +338,23 @@ module cdp::cdpContract {
         }
     }
 
+    // #[view]
+    // public fun get_user_balances(user_addr: address): (u64, u64) {
+    //     (
+    //         coin::balance<ORECoin>(user_addr),
+    //         coin::balance<SupraCoin>(user_addr)
+    //     )
+    // }
+
+    // #[view]
+    // public fun get_resource_account_balances(): (address, u64) acquires SignerCapability {
+    //     let signer_cap = &borrow_global<SignerCapability>(@cdp).cap;
+    //     let resource_signer = account::create_signer_with_capability(signer_cap);
+    //     let resource_addr = signer::address_of(&resource_signer);
+        
+    //     (resource_addr, coin::balance<SupraCoin>(resource_addr))
+    // }
+
     #[test_only]
     public fun mint_ore_for_test(addr: address, amount: u64) acquires TroveManager {
         let vault_manager = borrow_global_mut<TroveManager>(@cdp);
@@ -359,6 +367,7 @@ module cdp::cdpContract {
 module cdp::cdpContract_tests {
     use std::signer;
     use std::string;
+    use std::fixed_point32;
     use supra_framework::coin;
     use supra_framework::account;
     use cdp::cdpContract;
@@ -429,11 +438,11 @@ module cdp::cdpContract_tests {
          let (min_debt, mcr, borrow_rate, liq_reserve, liq_threshold) = cdpContract::get_config();
 
          // Print values 
-         std::debug::print(&min_debt); 
-         std::debug::print(&mcr); 
-         std::debug::print(&borrow_rate); 
-         std::debug::print(&liq_reserve); 
-         std::debug::print(&liq_threshold); 
+        //  std::debug::print(&min_debt); 
+        //  std::debug::print(&mcr); 
+        //  std::debug::print(&borrow_rate); 
+        //  std::debug::print(&liq_reserve); 
+        //  std::debug::print(&liq_threshold); 
 
          // Verify expected values 
          assert!(min_debt == 20 * 100000000, 0); 
@@ -481,7 +490,7 @@ module cdp::cdpContract_tests {
         assert!(coin::balance<SupraCoin>(user_addr) == supra_amount - collateral, 1);
 
         let balance = coin::balance<ORECoin>(user_addr);
-        std::debug::print(&balance);
+        // std::debug::print(&balance);
 
         // Verify trove exists and has correct values
         let (trove_collateral, trove_debt) = cdpContract::get_trove_info(@cdp);
@@ -532,9 +541,9 @@ module cdp::cdpContract_tests {
         let (actual_debt, actual_collateral, is_active) = cdpContract::get_user_position(user_addr);
         
         // Debug prints
-        std::debug::print(&actual_debt);
-        std::debug::print(&actual_collateral);
-        std::debug::print(&is_active);
+        // std::debug::print(&actual_debt);
+        // std::debug::print(&actual_collateral);
+        // std::debug::print(&is_active);
 
         // Assert user position values
         assert!(actual_debt == expected_total_debt, 0); // Verify debt amount
@@ -627,15 +636,15 @@ module cdp::cdpContract_tests {
         coin::deposit(user_addr, coins);
         
         // Debug print initial SUPRA balance
-        std::debug::print(&coin::balance<SupraCoin>(user_addr));
+        // std::debug::print(&coin::balance<SupraCoin>(user_addr));
         
         // Open initial trove
         cdpContract::open_trove(&user, initial_deposit, initial_borrow);
         
         // Debug print balances after opening trove
-        std::debug::print(&coin::balance<SupraCoin>(user_addr));
-        std::debug::print(&coin::balance<SupraCoin>(@cdp));
-        std::debug::print(&coin::balance<ORECoin>(user_addr));
+        // std::debug::print(&coin::balance<SupraCoin>(user_addr));
+        // std::debug::print(&coin::balance<SupraCoin>(@cdp));
+        // std::debug::print(&coin::balance<ORECoin>(user_addr));
         
         // Test repay_or_withdraw
         let withdraw_amount = 200 * 100000000; // 200 SUPRA
@@ -673,34 +682,42 @@ module cdp::cdpContract_tests {
 
 
 
-    #[test]
+   #[test]
     #[expected_failure(abort_code = cdpContract::ERR_INSUFFICIENT_COLLATERAL)]
     fun test_deposit_or_mint_fails_mcr() {
-        // Similar setup as above
+        // Setup initial state
         let framework = account::create_account_for_test(@0x1);
         let admin = get_admin_account();
         let user = account::create_account_for_test(@0x456);
         let user_addr = signer::address_of(&user);
         
+        // Initialize coins and contract
         let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
         cdpContract::initialize(&admin);
         
+        // Setup initial balances
         coin::register<SupraCoin>(&admin);
         coin::register<SupraCoin>(&user);
+        coin::register<ORECoin>(&user);
         
-        // Initial setup
-        let initial_supra = 2000 * 100000000;
-        let initial_deposit = 1000 * 100000000;
-        let initial_borrow = 400 * 100000000;
+        // Initial setup - deposit 100 SUPRA and mint 800 ORE
+        // With price of 10 USD per SUPRA:
+        // 100 SUPRA = 1000 USD collateral
+        // 800 ORE debt requires 1000 USD collateral at 125% MCR
+        let initial_supra = 200 * 100000000; // 200 SUPRA
+        let initial_deposit = 100 * 100000000; // 100 SUPRA
+        let initial_borrow = 800 * 100000000; // 800 ORE - at the MCR limit
         
+        // Give user initial SUPRA
         let coins = coin::mint(initial_supra, &mint_cap);
         coin::deposit(user_addr, coins);
         
+        // Open initial trove
         cdpContract::open_trove(&user, initial_deposit, initial_borrow);
         
-        // Try to mint too much ORE without enough collateral
-        let additional_mint = 900 * 100000000; // This should fail MCR check
-        cdpContract::deposit_or_mint(&user, 0, additional_mint);
+        // Try to mint more ORE without adding collateral
+        // This should fail as it would put the position below MCR
+        cdpContract::deposit_or_mint(&user, 0, 100 * 100000000); // Try to mint 100 more ORE
         
         coin::destroy_mint_cap(mint_cap);
         coin::destroy_burn_cap(burn_cap);
@@ -709,31 +726,37 @@ module cdp::cdpContract_tests {
     #[test]
     #[expected_failure(abort_code = cdpContract::ERR_INSUFFICIENT_COLLATERAL)]
     fun test_repay_or_withdraw_fails_mcr() {
-        // Similar setup as above
+        // Setup initial state
         let framework = account::create_account_for_test(@0x1);
         let admin = get_admin_account();
         let user = account::create_account_for_test(@0x456);
         let user_addr = signer::address_of(&user);
         
+        // Initialize coins and contract
         let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
         cdpContract::initialize(&admin);
         
+        // Setup initial balances
         coin::register<SupraCoin>(&admin);
         coin::register<SupraCoin>(&user);
         
-        // Initial setup
-        let initial_supra = 2000 * 100000000;
-        let initial_deposit = 1000 * 100000000;
-        let initial_borrow = 400 * 100000000;
+        // Initial setup - deposit 200 SUPRA and mint 800 ORE
+        let initial_supra = 300 * 100000000; // 300 SUPRA
+        let initial_deposit = 200 * 100000000; // 200 SUPRA
+        let initial_borrow = 800 * 100000000; // 800 ORE
         
+        // Give user initial SUPRA
         let coins = coin::mint(initial_supra, &mint_cap);
         coin::deposit(user_addr, coins);
         
+        // Open initial trove
         cdpContract::open_trove(&user, initial_deposit, initial_borrow);
         
         // Try to withdraw too much collateral
-        let withdraw_amount = 800 * 100000000; // This should fail MCR check
-        cdpContract::repay_or_withdraw(&user, withdraw_amount, 0);
+        // With price of 10 USD per SUPRA, 200 SUPRA = 2000 USD collateral
+        // Trying to withdraw 150 SUPRA would leave only 50 SUPRA (500 USD) backing 800 ORE
+        // This would put the ratio well below MCR of 125%
+        cdpContract::repay_or_withdraw(&user, 150 * 100000000, 0);
         
         coin::destroy_mint_cap(mint_cap);
         coin::destroy_burn_cap(burn_cap);
@@ -795,6 +818,145 @@ module cdp::cdpContract_tests {
         coin::destroy_mint_cap(mint_cap);
         coin::destroy_burn_cap(burn_cap);
     }
+
+    #[test]
+    fun test_get_supra_price() {
+        // Get the price using the module's function
+        let price = cdpContract::get_supra_price();
+        
+        // Convert to u64 for easier printing (multiply by 10000 to show decimal places)
+        let price_as_u64 = fixed_point32::multiply_u64(10000, price);
+        
+        // Print raw FixedPoint32 value
+        std::debug::print(&b"Raw FixedPoint32 SUPRA price:");
+        std::debug::print(&price);
+        
+        // Print human-readable value (should be 10.0000)
+        std::debug::print(&b"SUPRA price in USD (multiplied by 10000 for decimals):");
+        std::debug::print(&price_as_u64);
+        
+        // Verify price is correct (10 USD)
+        let expected_price = fixed_point32::create_from_rational(10 * 100000000, 100000000);
+        assert!(price == expected_price, 1);
+    }
+
+    #[test]
+    fun test_verify_collateral_ratio_valid() {
+        // Setup
+        let framework = account::create_account_for_test(@0x1);
+        let admin = get_admin_account();
+        let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
+        
+        // Initialize contract
+        cdpContract::initialize(&admin);
+        
+        // Test cases with valid ratios
+        // Case 1: Exactly at MCR (125%)
+        // With SUPRA price = 10 USD:
+        // 1000 SUPRA = 10000 USD collateral value
+        // 8000 ORE debt requires 10000 USD collateral at 125% MCR
+        cdpContract::verify_collateral_ratio(1000 * 100000000, 8000 * 100000000);
+        
+        // Case 2: Well above MCR (200%)
+        // 1000 SUPRA = 10000 USD collateral value
+        // 5000 ORE debt = 200% collateralization
+        cdpContract::verify_collateral_ratio(1000 * 100000000, 5000 * 100000000);
+        
+        // Case 3: Zero debt (should always pass)
+        cdpContract::verify_collateral_ratio(100 * 100000000, 0);
+        
+        coin::destroy_mint_cap(mint_cap);
+        coin::destroy_burn_cap(burn_cap);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = cdpContract::ERR_INSUFFICIENT_COLLATERAL)]
+    fun test_verify_collateral_ratio_below_mcr() {
+        // Setup
+        let framework = account::create_account_for_test(@0x1);
+        let admin = get_admin_account();
+        let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
+        
+        // Initialize contract
+        cdpContract::initialize(&admin);
+        
+        // Test case with invalid ratio (100%)
+        // 1000 SUPRA = 10000 USD collateral value
+        // 10000 ORE debt would require 12500 USD collateral at 125% MCR
+        cdpContract::verify_collateral_ratio(1000 * 100000000, 10000 * 100000000);
+        
+        coin::destroy_mint_cap(mint_cap);
+        coin::destroy_burn_cap(burn_cap);
+    }
+
+    #[test]
+    fun test_verify_collateral_ratio_edge_cases() {
+        // Setup
+        let framework = account::create_account_for_test(@0x1);
+        let admin = get_admin_account();
+        let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
+        
+        // Initialize contract
+        cdpContract::initialize(&admin);
+        
+        // Case 1: Zero collateral with zero debt (should pass)
+        cdpContract::verify_collateral_ratio(0, 0);
+        
+        // Case 2: Very large collateral amount
+        let large_collateral = 1000000 * 100000000; // 1 million SUPRA
+        let large_debt = 8000000 * 100000000; // 8 million ORE (maintains 125% ratio)
+        cdpContract::verify_collateral_ratio(large_collateral, large_debt);
+        
+        // Case 3: Minimum viable amounts
+        // With SUPRA price = 10 USD:
+        // 1 SUPRA = 10 USD collateral value
+        // 8 ORE debt requires 10 USD collateral at 125% MCR
+        cdpContract::verify_collateral_ratio(1 * 100000000, 8 * 100000000);
+        
+        coin::destroy_mint_cap(mint_cap);
+        coin::destroy_burn_cap(burn_cap);
+    }
+
+    #[test]
+    fun test_verify_collateral_ratio_calculations() {
+        // Setup
+        let framework = account::create_account_for_test(@0x1);
+        let admin = get_admin_account();
+        let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
+        
+        // Initialize contract
+        cdpContract::initialize(&admin);
+        
+        // Get the current MCR from config
+        let (_, mcr, _, _, _) = cdpContract::get_config();
+        std::debug::print(&b"Current MCR:");
+        std::debug::print(&mcr); // Should be 12500 (125%)
+        
+        // Get current SUPRA price
+        let price = cdpContract::get_supra_price();
+        let price_as_u64 = fixed_point32::multiply_u64(10000, price);
+        std::debug::print(&b"SUPRA price (scaled by 10000):");
+        std::debug::print(&price_as_u64); // Should be 100000 (10.0000 USD)
+        
+        // Test with exact MCR ratio
+        let collateral = 1000 * 100000000; // 1000 SUPRA
+        let debt = 8000 * 100000000; // 8000 ORE
+        
+        // Calculate and print the actual ratio for verification
+        let collateral_value = fixed_point32::multiply_u64(collateral, price);
+        let ratio_multiplier = fixed_point32::create_from_rational(10000, 1);
+        let actual_ratio = fixed_point32::multiply_u64(collateral_value, ratio_multiplier) / debt;
+        
+        std::debug::print(&b"Actual ratio:");
+        std::debug::print(&actual_ratio);
+        
+        // Verify the ratio is valid
+        cdpContract::verify_collateral_ratio(collateral, debt);
+        
+        coin::destroy_mint_cap(mint_cap);
+        coin::destroy_burn_cap(burn_cap);
+        }
+    
 
     // #[test]
     // fun test_initialize_coin_store() {
