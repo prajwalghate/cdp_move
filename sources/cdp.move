@@ -21,6 +21,9 @@ module cdp::cdpContract {
     const ERR_INSUFFICIENT_COLLATERAL_BALANCE: u64 = 6;
     const ERR_INSUFFICIENT_DEBT_BALANCE: u64 = 7;
 
+    const FEE_COLLECTOR: address = @0x1e54313f47251c2ef107578da12935f8abe6bee77410e06c804e28d23c156f44; // 
+    const LR_COLLECTOR: address = @0x18ffab5e7c45db3f94539686083b03e4c7cae248d8f5754639b190c02f2589f8; //
+
     struct ORECoin has store { value: u64 }
 
     struct ConfigParams has key {
@@ -82,7 +85,7 @@ module cdp::cdpContract {
         move_to(admin, ConfigParams {
             minimum_debt: 20 * 100000000, // 20 in base units
             mcr: 12500, // 110%
-            borrow_rate: 200, // 5% annual rate
+            borrow_rate: 200, // 2% annual rate
             liquidation_reserve: 2 * 100000000, // 2  in base units
             liquidation_threshold: 11000, // 130%
         });
@@ -108,13 +111,13 @@ module cdp::cdpContract {
     ) acquires ConfigParams, TroveManager, UserPositionsTable, SignerCapability {
         let user_addr = signer::address_of(user);
         
-        // Verify minimum debt
-        let config = borrow_global<ConfigParams>(@cdp);
-        assert!(ore_mint >= config.minimum_debt, ERR_BELOW_MINIMUM_DEBT);
+        // Get config parameters without borrowing
+        let (minimum_debt, _, borrow_rate, liquidation_reserve, _) = get_config();
+        assert!(ore_mint >= minimum_debt, ERR_BELOW_MINIMUM_DEBT);
         
-        // Calculate total debt including borrow fee
-        let borrow_fee = (ore_mint * config.borrow_rate) / 10000;
-        let total_debt = ore_mint + borrow_fee;
+        // Calculate total debt including borrow fee and liquidation reserve
+        let borrow_fee = (ore_mint * borrow_rate) / 10000;
+        let total_debt = ore_mint + borrow_fee + liquidation_reserve;
         
         // Verify MCR condition
         verify_collateral_ratio(supra_deposit, total_debt);
@@ -122,6 +125,7 @@ module cdp::cdpContract {
         let signer_cap = &borrow_global<SignerCapability>(@cdp).cap;
         let resource_signer = account::create_signer_with_capability(signer_cap);
         let resource_addr = signer::address_of(&resource_signer);
+        
         // Transfer SUPRA to contract
         coin::transfer<SupraCoin>(user, resource_addr, supra_deposit);
         
@@ -131,8 +135,18 @@ module cdp::cdpContract {
         };
         
         let vault_manager = borrow_global_mut<TroveManager>(@cdp);
+        
+        // Mint requested amount to user
         let ore_coins = coin::mint(ore_mint, &vault_manager.ore_mint_cap);
         coin::deposit(user_addr, ore_coins);
+        
+        // Mint borrow fee to FEE_COLLECTOR
+        let fee_coins = coin::mint(borrow_fee, &vault_manager.ore_mint_cap);
+        coin::deposit(FEE_COLLECTOR, fee_coins);
+        
+        // Mint liquidation reserve to LR_COLLECTOR
+        let lr_coins = coin::mint(liquidation_reserve, &vault_manager.ore_mint_cap);
+        coin::deposit(LR_COLLECTOR, lr_coins);
         
         // Update total stats
         vault_manager.total_collateral = vault_manager.total_collateral + supra_deposit;
@@ -148,7 +162,7 @@ module cdp::cdpContract {
             ore_mint: u64
     ) acquires ConfigParams, TroveManager, UserPositionsTable {
         let user_addr = signer::address_of(user);
-        
+        assert_trove_active(user_addr);
         // Get user's current position
         let positions_table = borrow_global<UserPositionsTable>(@cdp);
         assert!(table::contains(&positions_table.positions, user_addr), ERR_NO_TROVE_EXISTS);
@@ -175,6 +189,10 @@ module cdp::cdpContract {
             let vault_manager = borrow_global_mut<TroveManager>(@cdp);
             let ore_coins = coin::mint(ore_mint, &vault_manager.ore_mint_cap);
             coin::deposit(user_addr, ore_coins);
+
+            // Mint borrow fee to FEE_COLLECTOR
+            let fee_coins = coin::mint(borrow_fee, &vault_manager.ore_mint_cap);
+            coin::deposit(FEE_COLLECTOR, fee_coins);
             
             // Update total stats
             vault_manager.total_collateral = vault_manager.total_collateral + supra_deposit;
@@ -192,7 +210,7 @@ module cdp::cdpContract {
             ore_repay: u64
     ) acquires ConfigParams, TroveManager, UserPositionsTable, SignerCapability {
         let user_addr = signer::address_of(user);
-        
+        assert_trove_active(user_addr);
         // Get user's current position
         let positions_table = borrow_global<UserPositionsTable>(@cdp);
         assert!(table::contains(&positions_table.positions, user_addr), ERR_NO_TROVE_EXISTS);
@@ -242,12 +260,14 @@ module cdp::cdpContract {
 
     public entry fun close_trove(user: &signer) acquires TroveManager, UserPositionsTable, SignerCapability {
         let user_addr = signer::address_of(user);
-        
+        assert_trove_active(user_addr);
         // Get user's current position
         let positions_table = borrow_global<UserPositionsTable>(@cdp);
         assert!(table::contains(&positions_table.positions, user_addr), ERR_NO_TROVE_EXISTS);
         let position = table::borrow(&positions_table.positions, user_addr);
         // let user_balance = coin::balance<ORECoin>(user_addr);
+        // Then check if trove is active
+        assert!(position.is_active, ERR_NO_TROVE_EXISTS);
         
         // Ensure user has enough ORE to repay debt
         assert!(coin::balance<ORECoin>(user_addr) >= position.total_debt, ERR_INSUFFICIENT_DEBT_BALANCE);
@@ -291,6 +311,13 @@ module cdp::cdpContract {
         }
     }
 
+    fun assert_trove_active(user_addr: address) acquires UserPositionsTable {
+        let positions = borrow_global<UserPositionsTable>(@cdp);
+        assert!(table::contains(&positions.positions, user_addr), ERR_NO_TROVE_EXISTS);
+        let position = table::borrow(&positions.positions, user_addr);
+        assert!(position.is_active, ERR_NO_TROVE_EXISTS);
+    }
+
     public fun verify_collateral_ratio(collateral: u64, debt: u64) acquires ConfigParams {
         if (debt > 0) {
             let price = get_supra_price();
@@ -300,6 +327,23 @@ module cdp::cdpContract {
             
             assert!(mcr_check >= borrow_global<ConfigParams>(@cdp).mcr, ERR_INSUFFICIENT_COLLATERAL);
         }
+    }
+
+    public entry fun register_ore_coin(account: &signer) {
+        if (!coin::is_account_registered<ORECoin>(signer::address_of(account))) {
+            coin::register<ORECoin>(account);
+        }
+    }
+
+
+    #[view]
+    public fun get_fee_collector(): address {
+        FEE_COLLECTOR
+    }
+
+    #[view]
+    public fun get_lr_collector(): address {
+        LR_COLLECTOR
     }
 
 
@@ -370,12 +414,22 @@ module cdp::cdpContract_tests {
     use std::fixed_point32;
     use supra_framework::coin;
     use supra_framework::account;
+    use aptos_std::table;
     use cdp::cdpContract;
     use cdp::cdpContract::ORECoin;
     use supra_framework::supra_coin::SupraCoin;
 
     fun get_admin_account(): signer {
         account::create_account_for_test(@cdp)
+    }
+
+    fun setup_collector_accounts() {
+        let fee_collector = account::create_account_for_test(cdpContract::get_fee_collector());
+        let lr_collector = account::create_account_for_test(cdpContract::get_lr_collector());
+        
+        // Register both accounts for ORECoin
+        cdpContract::register_ore_coin(&fee_collector);
+        cdpContract::register_ore_coin(&lr_collector);
     }
 
      #[test]
@@ -388,6 +442,7 @@ module cdp::cdpContract_tests {
         //  supra_framework::supra_coin::initialize_for_test(&framework);
          // Initialize the contract 
          cdpContract::initialize(&admin);
+         setup_collector_accounts();
 
          // Verify ConfigParams values
          let (min_debt, mcr, borrow_rate, liq_reserve, liq_threshold) = cdpContract::get_config();
@@ -463,10 +518,13 @@ module cdp::cdpContract_tests {
         let admin = get_admin_account();
         let user = account::create_account_for_test(@0x456);
         let user_addr = signer::address_of(&user);
+
+        
         // First initialize SupraCoin using the framework account
         let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework); 
         // Initialize CDP contract (this will initialize ORECoin)
         cdpContract::initialize(&admin);
+        setup_collector_accounts();
         // Register accounts for coins
         coin::register<SupraCoin>(&admin); // Register admin (CDP contract) for SupraCoin
         coin::register<SupraCoin>(&user);
@@ -479,11 +537,13 @@ module cdp::cdpContract_tests {
         // Open trove with 1000 SUPRA collateral and borrow 500 ORE
         let collateral = 1000 * 100000000; // 1000 SUPRA
         let borrow_amount = 400 * 100000000; // 500 ORE
+        // let lr = 2 * 100000000; // 500 ORE
+
         cdpContract::open_trove(&user, collateral, borrow_amount);
         // Calculate expected total debt including borrow fee
-        let (_, _, borrow_rate, _, _) = cdpContract::get_config();
+        let (_, _, borrow_rate, liquidation_reserve, _) = cdpContract::get_config();
         let borrow_fee = (borrow_amount * borrow_rate) / 10000; // 5% fee
-        let total_debt = borrow_amount + borrow_fee;
+        let total_debt = borrow_amount + borrow_fee + liquidation_reserve;
         // Verify user received ORE coins (they receive the borrowed amount without the fee)
         assert!(coin::balance<ORECoin>(user_addr) == borrow_amount, 0);
         // Verify collateral was transferred
@@ -510,13 +570,13 @@ module cdp::cdpContract_tests {
         let admin = get_admin_account();
         let user = account::create_account_for_test(@0x456);
         let user_addr = signer::address_of(&user);
-
         // First initialize SupraCoin using the framework account
         let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework); 
 
         // Initialize CDP contract (this will initialize ORECoin)
         cdpContract::initialize(&admin);
 
+        setup_collector_accounts(); 
         // Register accounts for coins
         coin::register<SupraCoin>(&admin);
         coin::register<SupraCoin>(&user);
@@ -533,9 +593,9 @@ module cdp::cdpContract_tests {
         cdpContract::open_trove(&user, collateral, borrow_amount);
 
         // Calculate expected total debt including borrow fee
-        let (_, _, borrow_rate, _, _) = cdpContract::get_config();
+        let (_, _, borrow_rate, liquidation_reserve, _) = cdpContract::get_config();
         let borrow_fee = (borrow_amount * borrow_rate) / 10000; // 5% fee
-        let expected_total_debt = borrow_amount + borrow_fee;
+        let expected_total_debt = borrow_amount + borrow_fee +liquidation_reserve;
 
         // Get user position and verify it's correctly set
         let (actual_debt, actual_collateral, is_active) = cdpContract::get_user_position(user_addr);
@@ -562,11 +622,11 @@ module cdp::cdpContract_tests {
         let admin = get_admin_account();
         let user = account::create_account_for_test(@0x456);
         let user_addr = signer::address_of(&user);
-        
         // Initialize coins and contract
         let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
         cdpContract::initialize(&admin);
         
+        setup_collector_accounts();
         // Setup initial balances and open trove
         coin::register<SupraCoin>(&admin);
         coin::register<SupraCoin>(&user);
@@ -575,6 +635,7 @@ module cdp::cdpContract_tests {
         let initial_supra = 2000 * 100000000; // 2000 SUPRA for testing
         let initial_deposit = 1000 * 100000000; // 1000 SUPRA
         let initial_borrow = 400 * 100000000; // 400 ORE
+        let liquidation_reserve=2 * 100000000;
         
         // Give user initial SUPRA
         let coins = coin::mint(initial_supra, &mint_cap);
@@ -596,7 +657,7 @@ module cdp::cdpContract_tests {
         // Calculate expected debt including fees
         let initial_fee = (initial_borrow * 200) / 10000; // 5% fee
         let additional_fee = (additional_mint * 200) / 10000;
-        let expected_debt = initial_borrow + initial_fee + additional_mint + additional_fee;
+        let expected_debt = initial_borrow + initial_fee + additional_mint + additional_fee + liquidation_reserve;
         
         assert!(actual_collateral == expected_collateral, 0);
         assert!(actual_debt == expected_debt, 1);
@@ -617,11 +678,11 @@ module cdp::cdpContract_tests {
         let admin = get_admin_account();
         let user = account::create_account_for_test(@0x456);
         let user_addr = signer::address_of(&user);
-        
         // Initialize coins and contract
         let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
         cdpContract::initialize(&admin);
         
+        setup_collector_accounts();
         // Register accounts for coins
         coin::register<SupraCoin>(&user);
         coin::register<ORECoin>(&user);
@@ -663,7 +724,8 @@ module cdp::cdpContract_tests {
         
         // Calculate expected debt including initial fee
         let initial_fee = (initial_borrow * 200) / 10000; // 5% fee
-        let expected_debt = initial_borrow + initial_fee - repay_amount;
+        let liquidation_reserve=2 * 100000000;
+        let expected_debt = initial_borrow + initial_fee+liquidation_reserve - repay_amount;
         
         assert!(actual_collateral == expected_collateral, 0);
         assert!(actual_debt == expected_debt, 1);
@@ -672,6 +734,30 @@ module cdp::cdpContract_tests {
         // Verify balances
         assert!(coin::balance<ORECoin>(user_addr) == initial_borrow - repay_amount, 3);
         assert!(coin::balance<SupraCoin>(user_addr) == initial_supra - expected_collateral, 4);
+        
+        coin::destroy_mint_cap(mint_cap);
+        coin::destroy_burn_cap(burn_cap);
+    }
+
+    #[test]
+    fun test_register_ore_coin() {
+        let framework = account::create_account_for_test(@0x1);
+        let admin = get_admin_account();
+        let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
+        
+        cdpContract::initialize(&admin);
+        
+        // Create test account
+        let test_account = account::create_account_for_test(@0x123);
+        
+        // Verify account is not registered initially
+        assert!(!coin::is_account_registered<ORECoin>(signer::address_of(&test_account)), 0);
+        
+        // Register account
+        cdpContract::register_ore_coin(&test_account);
+        
+        // Verify account is now registered
+        assert!(coin::is_account_registered<ORECoin>(signer::address_of(&test_account)), 1);
         
         coin::destroy_mint_cap(mint_cap);
         coin::destroy_burn_cap(burn_cap);
@@ -690,10 +776,10 @@ module cdp::cdpContract_tests {
         let admin = get_admin_account();
         let user = account::create_account_for_test(@0x456);
         let user_addr = signer::address_of(&user);
-        
         // Initialize coins and contract
         let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
         cdpContract::initialize(&admin);
+        setup_collector_accounts();
         
         // Setup initial balances
         coin::register<SupraCoin>(&admin);
@@ -731,11 +817,11 @@ module cdp::cdpContract_tests {
         let admin = get_admin_account();
         let user = account::create_account_for_test(@0x456);
         let user_addr = signer::address_of(&user);
-        
         // Initialize coins and contract
         let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
         cdpContract::initialize(&admin);
         
+        setup_collector_accounts();
         // Setup initial balances
         coin::register<SupraCoin>(&admin);
         coin::register<SupraCoin>(&user);
@@ -769,11 +855,11 @@ module cdp::cdpContract_tests {
         let admin = get_admin_account();
         let user = account::create_account_for_test(@0x456);
         let user_addr = signer::address_of(&user);
-        
         // Initialize coins and contract
         let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
         cdpContract::initialize(&admin);
         
+        setup_collector_accounts();
         // Register accounts for coins
         coin::register<SupraCoin>(&user);
         coin::register<ORECoin>(&user);
@@ -791,17 +877,20 @@ module cdp::cdpContract_tests {
         cdpContract::open_trove(&user, initial_deposit, initial_borrow);
         
         // Calculate total debt including fee
-        let (_, _, borrow_rate, _, _) = cdpContract::get_config();
+        let (_, _, borrow_rate, liquidation_reserve, _) = cdpContract::get_config();
         let borrow_fee = (initial_borrow * borrow_rate) / 10000; // 5% fee
         
         // Mint additional ORE to cover the fee
-        cdpContract::mint_ore_for_test(user_addr, borrow_fee);
+        cdpContract::mint_ore_for_test(user_addr, borrow_fee+ liquidation_reserve);
+
+        let (actual_debt, actual_collateral, is_active) = cdpContract::get_user_position(user_addr);
+        assert!(is_active == true,4);
         
         // Close trove
         cdpContract::close_trove(&user);
         
         // Verify trove is closed and balances are correct
-        let (actual_debt, actual_collateral, is_active) = cdpContract::get_user_position(user_addr);
+        (actual_debt, actual_collateral, is_active) = cdpContract::get_user_position(user_addr);
         assert!(actual_debt == 0, 0);
         assert!(actual_collateral == 0, 1);
         assert!(is_active == false, 2);
@@ -956,6 +1045,91 @@ module cdp::cdpContract_tests {
         coin::destroy_mint_cap(mint_cap);
         coin::destroy_burn_cap(burn_cap);
         }
+
+    #[test]
+    fun test_collector_balances() {
+        // Setup initial state
+        let framework = account::create_account_for_test(@0x1);
+        let admin = get_admin_account();
+        let user = account::create_account_for_test(@0x456);
+        let user_addr = signer::address_of(&user);
+        
+        // Initialize coins and contract
+        let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
+        cdpContract::initialize(&admin);
+        
+        // Setup collector accounts
+        setup_collector_accounts();
+        
+        // Register user for coins
+        coin::register<SupraCoin>(&user);
+        coin::register<ORECoin>(&user);
+        
+        // Give user initial SUPRA
+        let initial_supra = 2000 * 100000000; // 2000 SUPRA
+        let coins = coin::mint(initial_supra, &mint_cap);
+        coin::deposit(user_addr, coins);
+        
+        // Test Case 1: Open Trove
+        let deposit_amount = 1000 * 100000000; // 1000 SUPRA
+        let borrow_amount = 400 * 100000000; // 400 ORE
+        
+        // Get initial balances
+        let fee_collector_initial = coin::balance<ORECoin>(cdpContract::get_fee_collector());
+        let lr_collector_initial = coin::balance<ORECoin>(cdpContract::get_lr_collector());
+        
+        // Open trove
+        cdpContract::open_trove(&user, deposit_amount, borrow_amount);
+        
+        // Calculate expected fees
+        let (_, _, borrow_rate, liquidation_reserve, _) = cdpContract::get_config();
+        let expected_fee = (borrow_amount * borrow_rate) / 10000;
+        
+        // Verify FEE_COLLECTOR received the correct fee
+        let fee_collector_after = coin::balance<ORECoin>(cdpContract::get_fee_collector());
+        assert!(fee_collector_after == fee_collector_initial + expected_fee, 1);
+        
+        // Verify LR_COLLECTOR received the liquidation reserve
+        let lr_collector_after = coin::balance<ORECoin>(cdpContract::get_lr_collector());
+        assert!(lr_collector_after == lr_collector_initial + liquidation_reserve, 2);
+        
+        // Test Case 2: Deposit or Mint (should only affect FEE_COLLECTOR)
+        let additional_mint = 200 * 100000000; // 200 ORE
+        
+        // Store FEE_COLLECTOR balance before additional mint
+        let fee_collector_before_mint = fee_collector_after;
+        let lr_collector_before_mint = lr_collector_after;
+        
+        // Perform additional mint
+        cdpContract::deposit_or_mint(&user, 0, additional_mint);
+        
+        // Calculate expected additional fee
+        let additional_fee = (additional_mint * borrow_rate) / 10000;
+        
+        // Verify FEE_COLLECTOR received the additional fee
+        let fee_collector_final = coin::balance<ORECoin>(cdpContract::get_fee_collector());
+        assert!(fee_collector_final == fee_collector_before_mint + additional_fee, 3);
+        
+        // Verify LR_COLLECTOR balance didn't change (no additional reserve for deposit_or_mint)
+        let lr_collector_final = coin::balance<ORECoin>(cdpContract::get_lr_collector());
+        assert!(lr_collector_final == lr_collector_before_mint, 4);
+        
+        // Print balances for debugging
+        std::debug::print(&b"Initial borrow fee:");
+        std::debug::print(&expected_fee);
+        std::debug::print(&b"Additional mint fee:");
+        std::debug::print(&additional_fee);
+        std::debug::print(&b"Liquidation reserve:");
+        std::debug::print(&liquidation_reserve);
+        std::debug::print(&b"Final FEE_COLLECTOR balance:");
+        std::debug::print(&fee_collector_final);
+        std::debug::print(&b"Final LR_COLLECTOR balance:");
+        std::debug::print(&lr_collector_final);
+        
+        coin::destroy_mint_cap(mint_cap);
+        coin::destroy_burn_cap(burn_cap);
+    }
+
     
 
     // #[test]
