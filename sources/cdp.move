@@ -59,6 +59,10 @@ module cdp::cdpContract {
         cap: account::SignerCapability
     }
 
+    struct PriceOracle has key {
+        price: fixed_point32::FixedPoint32
+    }
+
 
 
     
@@ -101,6 +105,11 @@ module cdp::cdpContract {
         move_to(admin, UserPositionsTable {
             positions: table::new(),
         });
+
+        // Initialize price oracle with default price
+        move_to(admin, PriceOracle {
+            price: fixed_point32::create_from_rational(10 * 100000000, 100000000) // Default 10 USD
+        });
     }
 
 
@@ -108,7 +117,7 @@ module cdp::cdpContract {
         user: &signer,
         supra_deposit: u64,
         ore_mint: u64
-    ) acquires ConfigParams, TroveManager, UserPositionsTable, SignerCapability {
+    ) acquires ConfigParams, TroveManager, UserPositionsTable, SignerCapability, PriceOracle  {
         let user_addr = signer::address_of(user);
         
         // Get config parameters without borrowing
@@ -160,7 +169,7 @@ module cdp::cdpContract {
             user: &signer,
             supra_deposit: u64,
             ore_mint: u64
-    ) acquires ConfigParams, TroveManager, UserPositionsTable {
+    ) acquires ConfigParams, TroveManager, UserPositionsTable, PriceOracle  {
         let user_addr = signer::address_of(user);
         assert_trove_active(user_addr);
         // Get user's current position
@@ -208,7 +217,7 @@ module cdp::cdpContract {
             user: &signer,
             supra_withdraw: u64,
             ore_repay: u64
-    ) acquires ConfigParams, TroveManager, UserPositionsTable, SignerCapability {
+    ) acquires ConfigParams, TroveManager, UserPositionsTable, SignerCapability, PriceOracle  {
         let user_addr = signer::address_of(user);
         assert_trove_active(user_addr);
         // Get user's current position
@@ -318,7 +327,7 @@ module cdp::cdpContract {
         assert!(position.is_active, ERR_NO_TROVE_EXISTS);
     }
 
-    public fun verify_collateral_ratio(collateral: u64, debt: u64) acquires ConfigParams {
+    public fun verify_collateral_ratio(collateral: u64, debt: u64) acquires ConfigParams, PriceOracle {
         if (debt > 0) {
             let price = get_supra_price();
             let total_collateral_value = fixed_point32::multiply_u64(collateral, price);
@@ -354,14 +363,19 @@ module cdp::cdpContract {
     }
 
     #[view]
-    public fun get_supra_price(): fixed_point32::FixedPoint32 {
-        fixed_point32::create_from_rational(10 * 100000000, 100000000) // 10 USD
+    public fun get_supra_price(): fixed_point32::FixedPoint32 acquires PriceOracle {
+        if (!exists<PriceOracle>(@cdp)) {
+            // Return default price of 10 USD if not set
+            fixed_point32::create_from_rational(10 * 100000000, 100000000)
+        } else {
+            *&borrow_global<PriceOracle>(@cdp).price
+        }
     }
 
     #[view]
-    public fun get_supra_price_raw(): u64 {
-        let price = get_supra_price();
-        fixed_point32::multiply_u64(100000000, price) // Convert FixedPoint32 to u64 with 8 decimals
+    public fun get_supra_price_raw(): u64 acquires PriceOracle {
+        let price_oracle = borrow_global<PriceOracle>(@cdp);
+        fixed_point32::multiply_u64(100000000, price_oracle.price) // Convert back to base units
     }
 
     #[view]
@@ -404,6 +418,20 @@ module cdp::cdpContract {
         let vault_manager = borrow_global_mut<TroveManager>(@cdp);
         let ore_coins = coin::mint(amount, &vault_manager.ore_mint_cap);
         coin::deposit(addr, ore_coins);
+    }
+
+    public entry fun set_price(admin: &signer, new_price: u64) acquires PriceOracle {
+        // Only admin can set price
+        assert!(signer::address_of(admin) == @cdp, 0); // You might want to add a specific error code
+        
+        let price = fixed_point32::create_from_rational(new_price, 100000000); // Assuming 8 decimals
+        
+        if (!exists<PriceOracle>(@cdp)) {
+            move_to(admin, PriceOracle { price });
+        } else {
+            let price_oracle = borrow_global_mut<PriceOracle>(@cdp);
+            price_oracle.price = price;
+        }
     }
 }
 
@@ -714,9 +742,9 @@ module cdp::cdpContract_tests {
         cdpContract::repay_or_withdraw(&user, withdraw_amount, repay_amount);
         
         // Debug print final balances
-        std::debug::print(&coin::balance<SupraCoin>(user_addr));
-        std::debug::print(&coin::balance<SupraCoin>(@cdp));
-        std::debug::print(&coin::balance<ORECoin>(user_addr));
+        // std::debug::print(&coin::balance<SupraCoin>(user_addr));
+        // std::debug::print(&coin::balance<SupraCoin>(@cdp));
+        // std::debug::print(&coin::balance<ORECoin>(user_addr));
         
         // Verify updated position
         let (actual_debt, actual_collateral, is_active) = cdpContract::get_user_position(user_addr);
@@ -917,12 +945,12 @@ module cdp::cdpContract_tests {
         let price_as_u64 = fixed_point32::multiply_u64(10000, price);
         
         // Print raw FixedPoint32 value
-        std::debug::print(&b"Raw FixedPoint32 SUPRA price:");
-        std::debug::print(&price);
+        // std::debug::print(&b"Raw FixedPoint32 SUPRA price:");
+        // std::debug::print(&price);
         
         // Print human-readable value (should be 10.0000)
-        std::debug::print(&b"SUPRA price in USD (multiplied by 10000 for decimals):");
-        std::debug::print(&price_as_u64);
+        // std::debug::print(&b"SUPRA price in USD (multiplied by 10000 for decimals):");
+        // std::debug::print(&price_as_u64);
         
         // Verify price is correct (10 USD)
         let expected_price = fixed_point32::create_from_rational(10 * 100000000, 100000000);
@@ -1018,14 +1046,14 @@ module cdp::cdpContract_tests {
         
         // Get the current MCR from config
         let (_, mcr, _, _, _) = cdpContract::get_config();
-        std::debug::print(&b"Current MCR:");
-        std::debug::print(&mcr); // Should be 12500 (125%)
+        // std::debug::print(&b"Current MCR:");
+        // std::debug::print(&mcr); // Should be 12500 (125%)
         
         // Get current SUPRA price
         let price = cdpContract::get_supra_price();
         let price_as_u64 = fixed_point32::multiply_u64(10000, price);
-        std::debug::print(&b"SUPRA price (scaled by 10000):");
-        std::debug::print(&price_as_u64); // Should be 100000 (10.0000 USD)
+        // std::debug::print(&b"SUPRA price (scaled by 10000):");
+        // std::debug::print(&price_as_u64); // Should be 100000 (10.0000 USD)
         
         // Test with exact MCR ratio
         let collateral = 1000 * 100000000; // 1000 SUPRA
@@ -1036,8 +1064,8 @@ module cdp::cdpContract_tests {
         let ratio_multiplier = fixed_point32::create_from_rational(10000, 1);
         let actual_ratio = fixed_point32::multiply_u64(collateral_value, ratio_multiplier) / debt;
         
-        std::debug::print(&b"Actual ratio:");
-        std::debug::print(&actual_ratio);
+        // std::debug::print(&b"Actual ratio:");
+        // std::debug::print(&actual_ratio);
         
         // Verify the ratio is valid
         cdpContract::verify_collateral_ratio(collateral, debt);
@@ -1115,20 +1143,22 @@ module cdp::cdpContract_tests {
         assert!(lr_collector_final == lr_collector_before_mint, 4);
         
         // Print balances for debugging
-        std::debug::print(&b"Initial borrow fee:");
-        std::debug::print(&expected_fee);
-        std::debug::print(&b"Additional mint fee:");
-        std::debug::print(&additional_fee);
-        std::debug::print(&b"Liquidation reserve:");
-        std::debug::print(&liquidation_reserve);
-        std::debug::print(&b"Final FEE_COLLECTOR balance:");
-        std::debug::print(&fee_collector_final);
-        std::debug::print(&b"Final LR_COLLECTOR balance:");
-        std::debug::print(&lr_collector_final);
+        // std::debug::print(&b"Initial borrow fee:");
+        // std::debug::print(&expected_fee);
+        // std::debug::print(&b"Additional mint fee:");
+        // std::debug::print(&additional_fee);
+        // std::debug::print(&b"Liquidation reserve:");
+        // std::debug::print(&liquidation_reserve);
+        // std::debug::print(&b"Final FEE_COLLECTOR balance:");
+        // std::debug::print(&fee_collector_final);
+        // std::debug::print(&b"Final LR_COLLECTOR balance:");
+        // std::debug::print(&lr_collector_final);
         
         coin::destroy_mint_cap(mint_cap);
         coin::destroy_burn_cap(burn_cap);
     }
+
+    
 
     
 
@@ -1170,4 +1200,215 @@ module cdp::cdpContract_tests {
     //     // Verify user received ORE coins
     //     // assert!(balance == mint_amount, 0);
     // }
+
+    #[test]
+    fun test_set_price() {
+        // Setup
+        let framework = account::create_account_for_test(@0x1);
+        let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
+        let admin = get_admin_account();
+        
+        // Initialize contract (sets default price of 10 USD)
+        cdpContract::initialize(&admin);
+        
+        // Verify initial price is 10 USD
+        let initial_price = cdpContract::get_supra_price();
+        let initial_price_u64 = fixed_point32::multiply_u64(10000, initial_price);
+        // std::debug::print(&b"Initial price:");
+        // std::debug::print(&initial_price_u64);
+        assert!(initial_price_u64 == 100000, 0); // Should be 10 USD (scaled)
+        
+        // Set new price to 15 USD
+        cdpContract::set_price(&admin, 15 * 100000000);
+        
+        // Verify new price
+        let new_price = cdpContract::get_supra_price();
+        let new_price_u64 = fixed_point32::multiply_u64(10000, new_price);
+        // std::debug::print(&b"New price:");
+        // std::debug::print(&new_price_u64);
+        assert!(new_price_u64 == 150000, 1); // Should be 15 USD (scaled)
+        
+        coin::destroy_mint_cap(mint_cap);
+        coin::destroy_burn_cap(burn_cap);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = 0)] // Using the generic error code we set
+    fun test_set_price_unauthorized() {
+        // Setup
+        let framework = account::create_account_for_test(@0x1);
+        let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
+        let admin = get_admin_account();
+        let unauthorized = account::create_account_for_test(@0x456);
+        
+        // Initialize contract
+        cdpContract::initialize(&admin);
+        
+        // Attempt to set price with unauthorized account (should fail)
+        cdpContract::set_price(&unauthorized, 15 * 100000000);
+        
+        coin::destroy_mint_cap(mint_cap);
+        coin::destroy_burn_cap(burn_cap);
+    }
+
+    #[test]
+    fun test_price_affects_collateral_ratio() {
+        // Setup
+        let framework = account::create_account_for_test(@0x1);
+        let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
+        let admin = get_admin_account();
+        
+        // Initialize contract
+        cdpContract::initialize(&admin);
+        
+        // Set price to 20 USD (double the default)
+        cdpContract::set_price(&admin, 20 * 100000000);
+        
+        // This should pass because price is 20 USD (double collateral value)
+        // 500 SUPRA * 20 USD = 10000 USD collateral value
+        // 8000 ORE debt requires 10000 USD collateral at 125% MCR
+        cdpContract::verify_collateral_ratio(500 * 100000000, 8000 * 100000000);
+        
+        coin::destroy_mint_cap(mint_cap);
+        coin::destroy_burn_cap(burn_cap);
+    }
+
+    // Separate test for the failing case
+    #[test]
+    #[expected_failure(abort_code = 3)] // ERR_INSUFFICIENT_COLLATERAL = 3
+    fun test_price_affects_collateral_ratio_fails() {
+        // Setup
+        let framework = account::create_account_for_test(@0x1);
+        let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
+        let admin = get_admin_account();
+        
+        // Initialize contract
+        cdpContract::initialize(&admin);
+        
+        // Set price to 10 USD
+        cdpContract::set_price(&admin, 10 * 100000000);
+        
+        // This should fail because with price at 10 USD:
+        // 500 SUPRA * 10 USD = 5000 USD collateral value
+        // 8000 ORE debt requires 10000 USD collateral at 125% MCR
+        cdpContract::verify_collateral_ratio(500 * 100000000, 8000 * 100000000);
+        
+        coin::destroy_mint_cap(mint_cap);
+        coin::destroy_burn_cap(burn_cap);
+    }
+
+    #[test]
+    fun test_operations_after_price_change() {
+        // Setup
+        let framework = account::create_account_for_test(@0x1);
+        let admin = get_admin_account();
+        let user = account::create_account_for_test(@0x456);
+        let user_addr = signer::address_of(&user);
+        
+        // Initialize framework
+        let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
+        cdpContract::initialize(&admin);
+        setup_collector_accounts();
+        
+        // Register user for coins
+        coin::register<SupraCoin>(&user);
+        coin::register<ORECoin>(&user);
+        
+        // Give user initial SUPRA
+        let initial_supra = 1000 * 100000000; // 1000 SUPRA
+        let coins = coin::mint(initial_supra, &mint_cap);
+        coin::deposit(user_addr, coins);
+        
+        // Debug: Print initial SUPRA balance
+        // std::debug::print(&b"Initial SUPRA balance:");
+        // std::debug::print(&coin::balance<SupraCoin>(user_addr));
+        
+        // Initial price is 10 USD
+        // First operation: Open trove with better collateral ratio
+        let deposit_amount = 200 * 100000000; // 200 SUPRA
+        let borrow_amount = 800 * 100000000; // 800 ORE
+        cdpContract::open_trove(&user, deposit_amount, borrow_amount);
+        
+        // Debug: Print balances after opening trove
+        // std::debug::print(&b"SUPRA balance after opening trove:");
+        // std::debug::print(&coin::balance<SupraCoin>(user_addr));
+        // std::debug::print(&b"ORE balance after opening trove:");
+        // std::debug::print(&coin::balance<ORECoin>(user_addr));
+        
+        // Change price to 50 USD
+        cdpContract::set_price(&admin, 50 * 100000000);
+        
+        // Additional operations...
+        let additional_mint = 2000 * 100000000; // 2000 more ORE
+        cdpContract::deposit_or_mint(&user, 0, additional_mint);
+        
+        // Debug: Print balances after additional mint
+        // std::debug::print(&b"ORE balance after additional mint:");
+        // std::debug::print(&coin::balance<ORECoin>(user_addr));
+        
+        // Before closing trove, make sure we have enough ORE to repay
+        let (current_debt, _, _) = cdpContract::get_user_position(user_addr);
+        // std::debug::print(&b"Current debt before closing:");
+        // std::debug::print(&current_debt);
+        
+        // Mint enough ORE to cover the debt plus some extra for fees
+        let required_ore = current_debt + (current_debt / 10); // Add 10% extra for fees
+        cdpContract::mint_ore_for_test(user_addr, required_ore);
+        
+        // Debug: Print final balances before closing
+        // std::debug::print(&b"Final ORE balance before closing:");
+        // std::debug::print(&coin::balance<ORECoin>(user_addr));
+        
+        cdpContract::close_trove(&user);
+        
+        // Verify trove is closed
+        let (final_debt, final_collateral, final_active) = cdpContract::get_user_position(user_addr);
+        assert!(final_debt == 0, 10);
+        assert!(final_collateral == 0, 11);
+        assert!(final_active == false, 12);
+        
+        // Clean up
+        coin::destroy_mint_cap(mint_cap);
+        coin::destroy_burn_cap(burn_cap);
+    }
+
+    #[test]
+    fun test_set_decimal_price() {
+        // Setup
+        let framework = account::create_account_for_test(@0x1);
+        let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
+        let admin = get_admin_account();
+        
+        // Initialize contract (sets default price of 10 USD)
+        cdpContract::initialize(&admin);
+        
+        // Test various decimal prices
+        
+        // Test 30.5 USD (30.5 * 10^8 = 3050000000)
+        cdpContract::set_price(&admin, 3050000000);
+        let price = cdpContract::get_supra_price_raw();
+        // std::debug::print(&b"Price set to 30.5 USD, raw value:");
+        // std::debug::print(&price);
+        // Allow for 1 unit of difference due to potential rounding
+        assert!(price >= 3050000000 - 1 && price <= 3050000000 + 1, 0);
+        
+        // Test 12.34 USD (12.34 * 10^8 = 1234000000)
+        cdpContract::set_price(&admin, 1234000000);
+        price = cdpContract::get_supra_price_raw();
+        // std::debug::print(&b"Price set to 12.34 USD, raw value:");
+        // std::debug::print(&price);
+        // Allow for 1 unit of difference due to potential rounding
+        assert!(price >= 1234000000 - 1 && price <= 1234000000 + 1, 1);
+        
+        // Test very small price: 0.05 USD (0.05 * 10^8 = 5000000)
+        cdpContract::set_price(&admin, 5000000);
+        price = cdpContract::get_supra_price_raw();
+        // std::debug::print(&b"Price set to 0.05 USD, raw value:");
+        // std::debug::print(&price);
+        // Allow for 1 unit of difference due to potential rounding
+        assert!(price >= 5000000 - 1 && price <= 5000000 + 1, 2);
+        
+        coin::destroy_mint_cap(mint_cap);
+        coin::destroy_burn_cap(burn_cap);
+    }
 }
