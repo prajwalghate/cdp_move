@@ -20,7 +20,7 @@ module cdp::cdpContract {
     const ERR_NO_TROVE_EXISTS: u64 = 5;
     const ERR_INSUFFICIENT_COLLATERAL_BALANCE: u64 = 6;
     const ERR_INSUFFICIENT_DEBT_BALANCE: u64 = 7;
-
+    const ERR_TROVE_ALREADY_ACTIVE: u64 = 8;    
     const FEE_COLLECTOR: address = @0x1e54313f47251c2ef107578da12935f8abe6bee77410e06c804e28d23c156f44; // 
     const LR_COLLECTOR: address = @0x18ffab5e7c45db3f94539686083b03e4c7cae248d8f5754639b190c02f2589f8; //
 
@@ -119,6 +119,13 @@ module cdp::cdpContract {
         ore_mint: u64
     ) acquires ConfigParams, TroveManager, UserPositionsTable, SignerCapability, PriceOracle  {
         let user_addr = signer::address_of(user);
+
+        // Check if trove exists and is active
+        let positions = borrow_global<UserPositionsTable>(@cdp);
+        if (table::contains(&positions.positions, user_addr)) {
+            let position = table::borrow(&positions.positions, user_addr);
+            assert!(!position.is_active, ERR_TROVE_ALREADY_ACTIVE);
+        };
         
         // Get config parameters without borrowing
         let (minimum_debt, _, borrow_rate, liquidation_reserve, _) = get_config();
@@ -169,7 +176,7 @@ module cdp::cdpContract {
             user: &signer,
             supra_deposit: u64,
             ore_mint: u64
-    ) acquires ConfigParams, TroveManager, UserPositionsTable, PriceOracle  {
+    ) acquires ConfigParams, TroveManager, UserPositionsTable,SignerCapability, PriceOracle  {
         let user_addr = signer::address_of(user);
         assert_trove_active(user_addr);
         // Get user's current position
@@ -187,7 +194,10 @@ module cdp::cdpContract {
         
         // Handle SUPRA deposit
         if (supra_deposit > 0) {
-            coin::transfer<SupraCoin>(user, @cdp, supra_deposit);
+            let signer_cap = &borrow_global<SignerCapability>(@cdp).cap;
+            let resource_signer = account::create_signer_with_capability(signer_cap);
+            let resource_addr = signer::address_of(&resource_signer);
+            coin::transfer<SupraCoin>(user, resource_addr, supra_deposit);
         };
         
         // Handle ORE minting
@@ -1407,6 +1417,123 @@ module cdp::cdpContract_tests {
         // std::debug::print(&price);
         // Allow for 1 unit of difference due to potential rounding
         assert!(price >= 5000000 - 1 && price <= 5000000 + 1, 2);
+        
+        coin::destroy_mint_cap(mint_cap);
+        coin::destroy_burn_cap(burn_cap);
+    }
+
+    #[test]
+    fun test_trove_state_transitions() {
+        // Setup
+        let framework = account::create_account_for_test(@0x1);
+        let admin = get_admin_account();
+        let user = account::create_account_for_test(@0x456);
+        let user_addr = signer::address_of(&user);
+        
+        // Initialize framework
+        let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
+        cdpContract::initialize(&admin);
+        setup_collector_accounts();
+        
+        // Register user for coins
+        coin::register<SupraCoin>(&user);
+        coin::register<ORECoin>(&user);
+        
+        // Give user initial SUPRA
+        let initial_supra = 2000 * 100000000; // 2000 SUPRA
+        let coins = coin::mint(initial_supra, &mint_cap);
+        coin::deposit(user_addr, coins);
+        
+        // Test 1: Initial state - should be able to open trove
+        let deposit_amount = 1000 * 100000000;
+        let borrow_amount = 400 * 100000000;
+        cdpContract::open_trove(&user, deposit_amount, borrow_amount);
+        
+        // Verify trove is active
+        let (debt, _, is_active) = cdpContract::get_user_position(user_addr);
+        assert!(is_active == true, 1);
+        
+        // Test 2: Should be able to deposit/mint while active
+        cdpContract::deposit_or_mint(&user, 100 * 100000000, 50 * 100000000);
+        
+        // Test 3: Should be able to repay/withdraw while active
+        cdpContract::repay_or_withdraw(&user, 50 * 100000000, 25 * 100000000);
+        
+        // Get current debt and mint enough ORE to cover it plus fees
+        let (current_debt, _, _) = cdpContract::get_user_position(user_addr);
+        let extra_buffer = current_debt / 10; // Add 10% extra for fees
+        cdpContract::mint_ore_for_test(user_addr, current_debt + extra_buffer);
+        
+        // Test 4: Close trove
+        cdpContract::close_trove(&user);
+        
+        // Verify trove is inactive
+        let (_, _, is_active) = cdpContract::get_user_position(user_addr);
+        assert!(is_active == false, 2);
+        
+        // Test 5: Should be able to open trove again
+        cdpContract::open_trove(&user, deposit_amount, borrow_amount);
+        
+        // Verify trove is active again
+        let (_, _, is_active) = cdpContract::get_user_position(user_addr);
+        assert!(is_active == true, 3);
+        
+        coin::destroy_mint_cap(mint_cap);
+        coin::destroy_burn_cap(burn_cap);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = cdpContract::ERR_TROVE_ALREADY_ACTIVE)]
+    fun test_cannot_open_active_trove() {
+        // Similar setup as above...
+        let framework = account::create_account_for_test(@0x1);
+        let admin = get_admin_account();
+        let user = account::create_account_for_test(@0x456);
+        let user_addr = signer::address_of(&user);
+        
+        let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
+        cdpContract::initialize(&admin);
+        setup_collector_accounts();
+        
+        coin::register<SupraCoin>(&user);
+        coin::register<ORECoin>(&user);
+        
+        let initial_supra = 2000 * 100000000;
+        let coins = coin::mint(initial_supra, &mint_cap);
+        coin::deposit(user_addr, coins);
+        
+        // Open trove first time
+        cdpContract::open_trove(&user, 1000 * 100000000, 400 * 100000000);
+        
+        // Try to open again while active (should fail)
+        cdpContract::open_trove(&user, 1000 * 100000000, 400 * 100000000);
+        
+        coin::destroy_mint_cap(mint_cap);
+        coin::destroy_burn_cap(burn_cap);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = cdpContract::ERR_NO_TROVE_EXISTS)]
+    fun test_cannot_operate_inactive_trove() {
+        // Similar setup as above...
+        let framework = account::create_account_for_test(@0x1);
+        let admin = get_admin_account();
+        let user = account::create_account_for_test(@0x456);
+        let user_addr = signer::address_of(&user);
+        
+        let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
+        cdpContract::initialize(&admin);
+        setup_collector_accounts();
+        
+        coin::register<SupraCoin>(&user);
+        coin::register<ORECoin>(&user);
+        
+        let initial_supra = 2000 * 100000000;
+        let coins = coin::mint(initial_supra, &mint_cap);
+        coin::deposit(user_addr, coins);
+        
+        // Try to deposit without opening trove first (should fail)
+        cdpContract::deposit_or_mint(&user, 100 * 100000000, 50 * 100000000);
         
         coin::destroy_mint_cap(mint_cap);
         coin::destroy_burn_cap(burn_cap);
