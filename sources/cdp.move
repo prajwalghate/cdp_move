@@ -21,6 +21,8 @@ module cdp::cdpContract {
     const ERR_INSUFFICIENT_COLLATERAL_BALANCE: u64 = 6;
     const ERR_INSUFFICIENT_DEBT_BALANCE: u64 = 7;
     const ERR_TROVE_ALREADY_ACTIVE: u64 = 8;    
+    const ERR_CANNOT_LIQUIDATE: u64 = 9;
+    const ERR_MUST_REPAY_FULL_DEBT: u64 = 10;
     const FEE_COLLECTOR: address = @0x1e54313f47251c2ef107578da12935f8abe6bee77410e06c804e28d23c156f44; // 
     const LR_COLLECTOR: address = @0x18ffab5e7c45db3f94539686083b03e4c7cae248d8f5754639b190c02f2589f8; //
 
@@ -32,7 +34,7 @@ module cdp::cdpContract {
         borrow_rate: u64,//2%
         liquidation_reserve: u64,//2 ore
         liquidation_threshold: u64,//110
-        //liquidation penalty
+        liquidation_penalty: u64,//10
         //
         //
     }
@@ -88,10 +90,11 @@ module cdp::cdpContract {
         // Set default parameters
         move_to(admin, ConfigParams {
             minimum_debt: 20 * 100000000, // 20 in base units
-            mcr: 12500, // 110%
+            mcr: 12500, // 125%
             borrow_rate: 200, // 2% annual rate
             liquidation_reserve: 2 * 100000000, // 2  in base units
-            liquidation_threshold: 11000, // 130%
+            liquidation_threshold: 15000, // 150%
+            liquidation_penalty: 1000, // 10%
         });
 
         move_to(admin, TroveManager {
@@ -128,7 +131,7 @@ module cdp::cdpContract {
         };
         
         // Get config parameters without borrowing
-        let (minimum_debt, _, borrow_rate, liquidation_reserve, _) = get_config();
+        let (minimum_debt, _, borrow_rate, liquidation_reserve, _,liq_penalty) = get_config();
         assert!(ore_mint >= minimum_debt, ERR_BELOW_MINIMUM_DEBT);
         
         // Calculate total debt including borrow fee and liquidation reserve
@@ -308,6 +311,95 @@ module cdp::cdpContract {
         update_user_position(user_addr, 0, 0, false)
     }
 
+
+
+    public entry fun liquidate(
+            liquidator: &signer,
+            user_addr: address
+    ) acquires ConfigParams, TroveManager, UserPositionsTable, SignerCapability, PriceOracle {
+        // Verify trove exists and is active
+        assert_trove_active(user_addr);
+        
+        // Get user's current position
+        let positions_table = borrow_global<UserPositionsTable>(@cdp);
+        let position = table::borrow(&positions_table.positions, user_addr);
+        
+        // Calculate current ratio
+        let price = get_supra_price();
+        let total_collateral_value = fixed_point32::multiply_u64(position.total_collateral, price);
+        let ratio_multiplier = fixed_point32::create_from_rational(10000, 1);
+        let current_ratio = fixed_point32::multiply_u64(total_collateral_value, ratio_multiplier) / position.total_debt;
+        
+        // Get config parameters
+        let config = borrow_global<ConfigParams>(@cdp);
+        
+        // Verify position is below liquidation threshold
+        assert!(current_ratio < config.liquidation_threshold, ERR_CANNOT_LIQUIDATE);
+        
+        // Calculate liquidator reward
+        let liquidator_reward_in_supra = {
+            // Calculate 110% of debt value in SUPRA terms
+            let debt_value_in_usd = position.total_debt;  // Since 1 ORE = 1 USD
+            let bonus_value_in_usd = (debt_value_in_usd * config.liquidation_penalty) / 10000;
+            let total_value_in_usd = debt_value_in_usd + bonus_value_in_usd;
+
+            std::debug::print(&(std::string::utf8(b"total_value_in_usd")));  
+            std::debug::print(&total_value_in_usd);
+            
+            // Convert USD value to SUPRA amount using current price
+            let desired_reward = fixed_point32::divide_u64(total_value_in_usd, price);
+            // let desired_reward = ((total_value_in_usd * 100000000) / fixed_point32::multiply_u64(100000000, price)) / 100000000;
+            std::debug::print(&(std::string::utf8(b"desired_reward")));  
+            std::debug::print(&desired_reward);
+
+            
+            // Take minimum of desired reward and available collateral
+            if (desired_reward > position.total_collateral) {
+                // If underwater, liquidator gets all available collateral
+                position.total_collateral
+            } else {
+                // Otherwise, liquidator gets exactly 110% of debt value
+                desired_reward
+            }
+        };
+        
+        // Transfer ORE from liquidator to contract and burn it
+        let vault_manager = borrow_global_mut<TroveManager>(@cdp);
+        let ore_coins = coin::withdraw<ORECoin>(liquidator, position.total_debt);
+        coin::burn(ore_coins, &vault_manager.ore_burn_cap);
+        
+        // Get resource signer for transfers
+        let signer_cap = &borrow_global<SignerCapability>(@cdp).cap;
+        let resource_signer = account::create_signer_with_capability(signer_cap);
+        
+        // Calculate and transfer fee collector portion (remaining collateral)
+        let fee_portion = position.total_collateral - liquidator_reward_in_supra;
+        if (fee_portion > 0) {
+            coin::transfer<SupraCoin>(&resource_signer, FEE_COLLECTOR, fee_portion);
+        };
+        
+        // Transfer reward to liquidator
+        coin::transfer<SupraCoin>(&resource_signer, signer::address_of(liquidator), liquidator_reward_in_supra);
+        
+        // Debug prints to verify distribution
+        std::debug::print(&b"Distribution verification:");
+        std::debug::print(&b"Total collateral:");
+        std::debug::print(&position.total_collateral);
+        std::debug::print(&b"Liquidator reward:");
+        std::debug::print(&liquidator_reward_in_supra);
+        std::debug::print(&b"Fee collector portion:");
+        std::debug::print(&fee_portion);
+        
+        // Verify total distribution equals original collateral
+        assert!(liquidator_reward_in_supra + fee_portion == position.total_collateral, 999);
+        
+        // Update global stats
+        vault_manager.total_debt = vault_manager.total_debt - position.total_debt;
+        vault_manager.total_collateral = vault_manager.total_collateral - position.total_collateral;
+        
+        // Close position
+        update_user_position(user_addr, 0, 0, false)
+    }
     
     fun update_user_position(
         user_addr: address, 
@@ -348,11 +440,50 @@ module cdp::cdpContract {
         }
     }
 
+    
+
     public entry fun register_ore_coin(account: &signer) {
         if (!coin::is_account_registered<ORECoin>(signer::address_of(account))) {
             coin::register<ORECoin>(account);
         }
     }
+
+    //make a function to register supra coin
+    public entry fun register_supra_coin(account: &signer) {
+        if (!coin::is_account_registered<SupraCoin>(signer::address_of(account))) {
+            coin::register<SupraCoin>(account);
+        }
+    }
+
+    public entry fun set_price(admin: &signer, new_price: u64) acquires PriceOracle {
+        // Only admin can set price
+        assert!(signer::address_of(admin) == @cdp, 0); //add a specific error code
+        
+        let price = fixed_point32::create_from_rational(new_price, 100000000); // Assuming 8 decimals
+        
+        if (!exists<PriceOracle>(@cdp)) {
+            move_to(admin, PriceOracle { price });
+        } else {
+            let price_oracle = borrow_global_mut<PriceOracle>(@cdp);
+            price_oracle.price = price;
+        }
+    }
+
+    // #[view]
+    // public fun get_user_ratio(user_addr: address): u64 acquires UserPositionsTable, PriceOracle {
+    //     let positions = borrow_global<UserPositionsTable>(@cdp);
+    //     assert!(table::contains(&positions.positions, user_addr), ERR_NO_TROVE_EXISTS);
+    //     let position = table::borrow(&positions.positions, user_addr);
+
+    //     if (position.total_debt == 0) {
+    //         return 0
+    //     };
+
+    //     let price = get_supra_price();
+    //     let total_collateral_value = fixed_point32::multiply_u64(position.total_collateral, price);
+    //     let ratio_multiplier = fixed_point32::create_from_rational(10000, 1);
+    //     fixed_point32::multiply_u64(total_collateral_value, ratio_multiplier) / position.total_debt
+    // }
 
 
     #[view]
@@ -367,9 +498,9 @@ module cdp::cdpContract {
 
 
     #[view]
-    public fun get_config(): (u64, u64, u64, u64, u64) acquires ConfigParams {
+    public fun get_config(): (u64, u64, u64, u64, u64,u64) acquires ConfigParams {
         let config = borrow_global<ConfigParams>(@cdp);
-        (config.minimum_debt, config.mcr, config.borrow_rate, config.liquidation_reserve, config.liquidation_threshold)
+        (config.minimum_debt, config.mcr, config.borrow_rate, config.liquidation_reserve, config.liquidation_threshold,config.liquidation_penalty)
     }
 
     #[view]
@@ -406,6 +537,7 @@ module cdp::cdpContract {
         }
     }
 
+
     // #[view]
     // public fun get_user_balances(user_addr: address): (u64, u64) {
     //     (
@@ -430,19 +562,7 @@ module cdp::cdpContract {
         coin::deposit(addr, ore_coins);
     }
 
-    public entry fun set_price(admin: &signer, new_price: u64) acquires PriceOracle {
-        // Only admin can set price
-        assert!(signer::address_of(admin) == @cdp, 0); // You might want to add a specific error code
-        
-        let price = fixed_point32::create_from_rational(new_price, 100000000); // Assuming 8 decimals
-        
-        if (!exists<PriceOracle>(@cdp)) {
-            move_to(admin, PriceOracle { price });
-        } else {
-            let price_oracle = borrow_global_mut<PriceOracle>(@cdp);
-            price_oracle.price = price;
-        }
-    }
+    
 }
 
 #[test_only]
@@ -468,6 +588,8 @@ module cdp::cdpContract_tests {
         // Register both accounts for ORECoin
         cdpContract::register_ore_coin(&fee_collector);
         cdpContract::register_ore_coin(&lr_collector);
+        cdpContract::register_supra_coin(&fee_collector);
+        cdpContract::register_supra_coin(&lr_collector);
     }
 
      #[test]
@@ -483,12 +605,12 @@ module cdp::cdpContract_tests {
          setup_collector_accounts();
 
          // Verify ConfigParams values
-         let (min_debt, mcr, borrow_rate, liq_reserve, liq_threshold) = cdpContract::get_config();
+         let (min_debt, mcr, borrow_rate, liq_reserve, liq_threshold,liq_penalty) = cdpContract::get_config();
          assert!(min_debt == 20 * 100000000, 0);
          assert!(mcr == 12500, 1);
          assert!(borrow_rate == 200, 2);
          assert!(liq_reserve == 2 * 100000000, 3);
-         assert!(liq_threshold == 11000, 4);
+         assert!(liq_threshold == 15000, 4);
 
          // Verify ORE coin initialization
          assert!(coin::is_coin_initialized<ORECoin>(), 5);
@@ -528,7 +650,7 @@ module cdp::cdpContract_tests {
          cdpContract::initialize(&admin); 
 
          // Get config params 
-         let (min_debt, mcr, borrow_rate, liq_reserve, liq_threshold) = cdpContract::get_config();
+         let (min_debt, mcr, borrow_rate, liq_reserve, liq_threshold,liq_penalty) = cdpContract::get_config();
 
          // Print values 
         //  std::debug::print(&min_debt); 
@@ -542,7 +664,7 @@ module cdp::cdpContract_tests {
          assert!(mcr == 12500, 1); 
          assert!(borrow_rate == 200, 2); 
          assert!(liq_reserve == 2 * 100000000, 3); 
-         assert!(liq_threshold == 11000, 4); 
+         assert!(liq_threshold == 15000, 4); 
          coin::destroy_mint_cap(mint_cap);
          coin::destroy_burn_cap(burn_cap);
      }
@@ -579,7 +701,7 @@ module cdp::cdpContract_tests {
 
         cdpContract::open_trove(&user, collateral, borrow_amount);
         // Calculate expected total debt including borrow fee
-        let (_, _, borrow_rate, liquidation_reserve, _) = cdpContract::get_config();
+        let (_, _, borrow_rate, liquidation_reserve, _,liq_penalty) = cdpContract::get_config();
         let borrow_fee = (borrow_amount * borrow_rate) / 10000; // 5% fee
         let total_debt = borrow_amount + borrow_fee + liquidation_reserve;
         // Verify user received ORE coins (they receive the borrowed amount without the fee)
@@ -599,7 +721,7 @@ module cdp::cdpContract_tests {
         coin::destroy_burn_cap(burn_cap);
     }
 
-        #[test]
+    #[test]
     fun test_open_trove_user_position() {
         // Create supra framework account for proper initialization
         let framework = account::create_account_for_test(@0x1);
@@ -631,7 +753,7 @@ module cdp::cdpContract_tests {
         cdpContract::open_trove(&user, collateral, borrow_amount);
 
         // Calculate expected total debt including borrow fee
-        let (_, _, borrow_rate, liquidation_reserve, _) = cdpContract::get_config();
+        let (_, _, borrow_rate, liquidation_reserve, _,liq_penalty) = cdpContract::get_config();
         let borrow_fee = (borrow_amount * borrow_rate) / 10000; // 5% fee
         let expected_total_debt = borrow_amount + borrow_fee +liquidation_reserve;
 
@@ -915,7 +1037,7 @@ module cdp::cdpContract_tests {
         cdpContract::open_trove(&user, initial_deposit, initial_borrow);
         
         // Calculate total debt including fee
-        let (_, _, borrow_rate, liquidation_reserve, _) = cdpContract::get_config();
+        let (_, _, borrow_rate, liquidation_reserve, _,liq_penalty) = cdpContract::get_config();
         let borrow_fee = (initial_borrow * borrow_rate) / 10000; // 5% fee
         
         // Mint additional ORE to cover the fee
@@ -1055,7 +1177,7 @@ module cdp::cdpContract_tests {
         cdpContract::initialize(&admin);
         
         // Get the current MCR from config
-        let (_, mcr, _, _, _) = cdpContract::get_config();
+        let (_, mcr, _, _, _,_) = cdpContract::get_config();
         // std::debug::print(&b"Current MCR:");
         // std::debug::print(&mcr); // Should be 12500 (125%)
         
@@ -1120,7 +1242,7 @@ module cdp::cdpContract_tests {
         cdpContract::open_trove(&user, deposit_amount, borrow_amount);
         
         // Calculate expected fees
-        let (_, _, borrow_rate, liquidation_reserve, _) = cdpContract::get_config();
+        let (_, _, borrow_rate, liquidation_reserve, _,liq_penalty) = cdpContract::get_config();
         let expected_fee = (borrow_amount * borrow_rate) / 10000;
         
         // Verify FEE_COLLECTOR received the correct fee
@@ -1538,4 +1660,258 @@ module cdp::cdpContract_tests {
         coin::destroy_mint_cap(mint_cap);
         coin::destroy_burn_cap(burn_cap);
     }
+
+   #[test]
+    fun test_liquidation() {
+        // 1. Setup accounts
+        let framework = account::create_account_for_test(@0x1);
+        let admin = get_admin_account();
+        let user = account::create_account_for_test(@0x123);
+        let liquidator = account::create_account_for_test(@0x456);
+        
+        // 2. Initialize the system
+        let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
+        cdpContract::initialize(&admin);
+        setup_collector_accounts();
+        
+        // 3. Setup user's trove
+        // Register coins
+        coin::register<SupraCoin>(&user);
+        coin::register<ORECoin>(&user);
+        coin::register<SupraCoin>(&liquidator);
+        coin::register<ORECoin>(&liquidator);
+        
+        // Give user SUPRA
+        let collateral = 1000 * 100000000; // 1000 SUPRA
+        let debt = 400 * 100000000;        // 400 ORE
+        let coins = coin::mint(collateral, &mint_cap);
+        coin::deposit(signer::address_of(&user), coins);
+
+        ///calculate and print the ratio dont fetch it from the contract
+        let ratio = (collateral * 10*100) / debt;
+        std::debug::print(&(std::string::utf8(b"Initial ratio")));
+        std::debug::print(&ratio);
+        
+       // Open trove
+        cdpContract::open_trove(&user, collateral, debt);
+        
+        // 4. Setup liquidator with ORE (add extra for fees)
+        let liquidator_ore = debt + (debt / 10); // Add 10% extra for potential fees
+        cdpContract::mint_ore_for_test(signer::address_of(&liquidator), liquidator_ore);
+        
+        // Store initial balances
+        let liquidator_initial_supra = coin::balance<SupraCoin>(signer::address_of(&liquidator));
+        let fee_collector_initial_supra = coin::balance<SupraCoin>(cdpContract::get_fee_collector());
+        
+        // 5. Drop price to make trove liquidatable (112% ratio)
+        cdpContract::set_price(&admin, 45920000); // $0.4592
+        
+        // Get user position before liquidation
+        let (total_debt, _, _) = cdpContract::get_user_position(signer::address_of(&user));
+        
+        // 6. Execute liquidation
+        cdpContract::liquidate(&liquidator, signer::address_of(&user));
+        
+        // 7. Verify results
+        let (user_debt, user_collateral, is_active) = cdpContract::get_user_position(signer::address_of(&user));
+        assert!(user_debt == 0, 1);
+        assert!(user_collateral == 0, 2);
+        assert!(!is_active, 3);
+        
+        // Calculate expected liquidator reward (110% of debt value in SUPRA)
+        let price = cdpContract::get_supra_price();
+        // Convert debt value to SUPRA amount: (debt * 110%) / price
+        // let expected_supra = (total_debt * 11000) / fixed_point32::multiply_u64(100000000, price);
+                // Calculate expected SUPRA reward
+        let total_value_in_usd = (total_debt * 110) / 100;  // 110% of debt
+        let expected_supra = ((total_value_in_usd * 100000000) / fixed_point32::multiply_u64(100000000, price));
+        
+        // Verify liquidator received exactly 110% of debt value in SUPRA
+        let liquidator_final_supra = coin::balance<SupraCoin>(signer::address_of(&liquidator));
+        let liquidator_reward = liquidator_final_supra - liquidator_initial_supra;
+        std::debug::print(&(std::string::utf8(b"liquidator_reward in test_liquidation")));  
+        std::debug::print(&liquidator_reward); 
+        std::debug::print(&(std::string::utf8(b"expected_supra in test_liquidation")));  
+        std::debug::print(&expected_supra);  
+        let difference = if (liquidator_reward > expected_supra) {
+            liquidator_reward - expected_supra
+        } else {
+            expected_supra - liquidator_reward
+        };
+        
+        // Allow for 0.01% difference (1 basis point)
+        assert!(difference <= expected_supra / 10000, 4);
+        
+        // Verify fee collector received remaining collateral
+        let fee_collector_final_supra = coin::balance<SupraCoin>(cdpContract::get_fee_collector());
+        let fee_collector_reward = fee_collector_final_supra - fee_collector_initial_supra;
+                // Calculate expected fee collector reward
+        let expected_fee = collateral - expected_supra;
+        
+        // Calculate difference for fee collector reward
+        let fee_difference = if (fee_collector_reward > expected_fee) {
+            fee_collector_reward - expected_fee
+        } else {
+            expected_fee - fee_collector_reward
+        };
+        
+        // Allow for 0.01% difference (1 basis point)
+        assert!(fee_difference <= expected_fee / 10000, 5);
+        
+       
+        coin::destroy_mint_cap(mint_cap);
+        coin::destroy_burn_cap(burn_cap);
+    }
+  
+    #[test]
+    fun test_deeply_underwater_liquidation() {
+        // Setup similar to above
+        let framework = account::create_account_for_test(@0x1);
+        let admin = get_admin_account();
+        let user = account::create_account_for_test(@0x123);
+        let liquidator = account::create_account_for_test(@0x456);
+        
+        let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
+        cdpContract::initialize(&admin);
+        setup_collector_accounts();
+        
+        // Register coins
+        coin::register<SupraCoin>(&user);
+        coin::register<ORECoin>(&user);
+        coin::register<SupraCoin>(&liquidator);
+        coin::register<ORECoin>(&liquidator);
+        
+        // Setup trove: 1000 SUPRA collateral, 400 ORE debt
+        let collateral = 1000 * 100000000;
+        let debt = 400 * 100000000;
+        let coins = coin::mint(collateral, &mint_cap);
+        coin::deposit(signer::address_of(&user), coins);
+        cdpContract::open_trove(&user, collateral, debt);
+        
+        // Give liquidator enough ORE
+        cdpContract::mint_ore_for_test(signer::address_of(&liquidator), debt + (debt / 10));
+        
+        // Drop price severely (below 10% ratio)
+        cdpContract::set_price(&admin, 3000000); // $0.03
+        
+        // Record initial balances
+        let fee_collector_addr = cdpContract::get_fee_collector();
+        let initial_fee_collector_balance = coin::balance<SupraCoin>(fee_collector_addr);
+        
+        // Execute liquidation
+        cdpContract::liquidate(&liquidator, signer::address_of(&user));
+        
+        // Verify liquidator got all collateral
+        let liquidator_balance = coin::balance<SupraCoin>(signer::address_of(&liquidator));
+        assert!(liquidator_balance == collateral, 1);
+        
+        // Verify fee collector received nothing
+        let final_fee_collector_balance = coin::balance<SupraCoin>(fee_collector_addr);
+        assert!(final_fee_collector_balance == initial_fee_collector_balance, 2);
+        
+        coin::destroy_mint_cap(mint_cap);
+        coin::destroy_burn_cap(burn_cap);
+    }
+
+
+    // #[test]
+    // #[expected_failure(abort_code = cdpContract::ERR_NO_TROVE_EXISTS)]
+    // fun test_get_user_ratio_no_trove() {
+    //     // Setup
+    //     let framework = account::create_account_for_test(@0x1);
+    //     let admin = get_admin_account();
+    //     let user = account::create_account_for_test(@0x456);
+        
+    //     // Initialize framework
+    //     let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
+    //     cdpContract::initialize(&admin);
+        
+    //     // Try to get ratio for non-existent trove
+    //     cdpContract::get_user_ratio(signer::address_of(&user));
+        
+    //     coin::destroy_mint_cap(mint_cap);
+    //     coin::destroy_burn_cap(burn_cap);
+    // }
+
+
+
+    // #[test]
+    // fun test_get_user_ratio() {
+    //     // Setup
+    //     let framework = account::create_account_for_test(@0x1);
+    //     let admin = get_admin_account();
+    //     let user = account::create_account_for_test(@0x456);
+    //     let user_addr = signer::address_of(&user);
+        
+    //     // Initialize framework
+    //     let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
+    //     cdpContract::initialize(&admin);
+    //     setup_collector_accounts();
+        
+    //     // Register user for coins
+    //     coin::register<SupraCoin>(&user);
+    //     coin::register<ORECoin>(&user);
+        
+    //     // Give user initial SUPRA
+    //     let initial_supra = 1000 * 100000000; // 1000 SUPRA
+    //     let coins = coin::mint(initial_supra, &mint_cap);
+    //     coin::deposit(user_addr, coins);
+        
+    //     // Set price to $10
+    //     cdpContract::set_price(&admin, 10 * 100000000); // $10.00
+        
+    //     // Open trove with 200 SUPRA collateral and 100 ORE debt
+    //     cdpContract::open_trove(&user, 200 * 100000000, 100 * 100000000);
+        
+    //     // Debug print values
+    //     let ratio = cdpContract::get_user_ratio(user_addr);
+    //     std::debug::print(&ratio);
+        
+    //     // At $10: (200 * 10) / 100 = 20
+    //     // 20 * 100 = 2000% (scaled by 100)
+    //     assert!(ratio >= 1900 && ratio <= 2100, 1); // Allow some margin for rounding
+        
+    //     coin::destroy_mint_cap(mint_cap);
+    //     coin::destroy_burn_cap(burn_cap);
+    // }
+
+    // #[test]
+    // fun test_get_user_ratio_edge_cases() {
+    //     // Setup
+    //     let framework = account::create_account_for_test(@0x1);
+    //     let admin = get_admin_account();
+    //     let user = account::create_account_for_test(@0x456);
+    //     let user_addr = signer::address_of(&user);
+        
+    //     // Initialize framework
+    //     let (burn_cap, mint_cap) = supra_framework::supra_coin::initialize_for_test(&framework);
+    //     cdpContract::initialize(&admin);
+    //     setup_collector_accounts();
+        
+    //     // Register user for coins
+    //     coin::register<SupraCoin>(&user);
+    //     coin::register<ORECoin>(&user);
+        
+    //     // Give user initial SUPRA
+    //     let initial_supra = 1000 * 100000000; // 1000 SUPRA
+    //     let coins = coin::mint(initial_supra, &mint_cap);
+    //     coin::deposit(user_addr, coins);
+        
+    //     // Get minimum debt and set price
+    //     let (_, minimum_debt, _, _, _) = cdpContract::get_config();
+    //     cdpContract::set_price(&admin, 10 * 100000000); // $10.00
+        
+    //     // Test Case 1: Very high ratio
+    //     // Open trove with 1000 SUPRA collateral and minimum debt
+    //     cdpContract::open_trove(&user, 1000 * 100000000, minimum_debt);
+    //     let high_ratio = cdpContract::get_user_ratio(user_addr);
+    //     std::debug::print(&high_ratio);
+    //     assert!(high_ratio > 10000, 1); // Should be very high (>1000%)
+        
+    //     coin::destroy_mint_cap(mint_cap);
+    //     coin::destroy_burn_cap(burn_cap);
+    // }
+
+    
+
 }
